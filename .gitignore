@@ -1,0 +1,21 @@
+# Kernel module build outputs
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+__pycache__/
+
+# Test captures
+*.png
+*.yuv
+*.ppm
+
+# AVerMedia's proprietary Windows driver and its disassembly: kept locally for
+# reverse-engineering reference, not ours to redistribute
+H727 Driver/
+decompiled/*.sys
+decompiled/*.asm

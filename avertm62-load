@@ -1,0 +1,23 @@
+#!/bin/sh
+# avertm62-load - reload the avertm62 module from the build directory.
+# Installed root-owned in /usr/local/sbin so it can be run with sudo -n.
+# Only name=integer module parameters are accepted.
+set -eu
+
+KO="/home/shinji/Home Entertainment/avertm62/avertm62.ko"
+
+for arg in "$@"; do
+	case "$arg" in
+	*[!A-Za-z0-9_=-]*|=*|*=|-*) echo "rejected parameter: $arg" >&2; exit 2 ;;
+	*=*) ;;
+	*) echo "parameters must be name=value: $arg" >&2; exit 2 ;;
+	esac
+done
+
+modprobe videodev
+modprobe videobuf2-v4l2
+modprobe videobuf2-vmalloc
+modprobe i2c-dev
+rmmod avertm62 2>/dev/null || true
+insmod "$KO" "$@"
+dmesg | grep avertm62 | tail -n 5
