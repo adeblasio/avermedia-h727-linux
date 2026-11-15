@@ -199,6 +199,16 @@ The AD9985A is the **component** front end: its 17-register mode table
   - Toggling GPIO4, GPIO6 or GPIO7 makes the demodulator lose lock (GPIO7 is
     the INF's "SiI9011 reset" but evidently also disturbs the tuner side);
     a driver reload recovers it.
+  - Overnight 2026-11-16, with ABC locked in both serial and parallel TS
+    mode, nothing delivered TS data. Tried on channels 0x300/0x400/0x330/
+    0x430/0x360/0x460 with engine sources 0-3:
+    - TM6010 digital-mode settings: `RC0` (0x00c0[7:0]) bit 6 "TS input
+      enable", `RCC` (0x00cc[7:0]) video/audio interface bits 5-6 cleared,
+      `RFE` (0x00fc[23:16]) = 0x28
+    - `0x0188[29]` and `[30]` (Windows 0x53b90 writes [29] from a per-device
+      setting), with the HDMI receiver's outputs off
+    - the second TS route pair `0x019c[17:16]` (Windows stream type 3)
+    The 0x0730-0x0744 block is an audio clock (sample-rate dividers), not TS.
   - Windows' TS stream object (vtable 0x102570, ctor at 0x45920, base
     0x5ff7c) uses engine index 0 by default; the source index it writes to
     [19:18] comes from a field set outside the constructor (not found yet).
