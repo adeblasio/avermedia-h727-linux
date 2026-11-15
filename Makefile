@@ -6,6 +6,7 @@ all:
 	@rm -rf $(BUILD_DIR)
 	@mkdir -p $(BUILD_DIR)
 	@cp avertm62.c $(BUILD_DIR)/
+	@cp -r kheaders $(BUILD_DIR)/
 	@echo "obj-m += avertm62.o" > $(BUILD_DIR)/Makefile
 	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(BUILD_DIR) modules
 	@cp $(BUILD_DIR)/avertm62.ko .

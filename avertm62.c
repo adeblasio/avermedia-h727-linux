@@ -26,6 +26,10 @@
 #include <media/v4l2-event.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
+#include <media/dvb_frontend.h>
+#include <media/dvbdev.h>
+#include "kheaders/drxk.h"
+#include "kheaders/tda18271.h"
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
 #define avertm62_timer_del_sync(t) timer_delete_sync(t)
@@ -69,6 +73,43 @@ MODULE_PARM_DESC(clk_src, "Force 0x0760[18:16] at stream start (0-7, -1 = defaul
 static int str_route;
 module_param(str_route, int, 0644);
 MODULE_PARM_DESC(str_route, "Set 0x019c[21:20,17:16] TS/audio route bits (0 = clear, Windows video path; 1 = set)");
+
+#define AVERTM62_INPUT_HDMI		0
+#define AVERTM62_INPUT_COMPOSITE	1	/* breakout socket, TM6202 internal decoder */
+#define AVERTM62_NUM_INPUTS		2
+
+/* Composite is PAL only for now: 720x576, two 288-line fields per frame */
+#define AVERTM62_PAL_WIDTH		720
+#define AVERTM62_PAL_HEIGHT		576
+
+/*
+ * Digital TV (DVB-T/C): Micronas DRX-K demodulator (I2C0 0x52, reset on
+ * GPIO5) + NXP TDA18271C2 tuner (I2C0 0xc0, directly on the bus, not behind
+ * the DRX-K I2C gate). Board settings from the Windows INF. Off by default
+ * while the transport-stream DMA path is still being worked out.
+ */
+static int dvb;
+module_param(dvb, int, 0444);
+MODULE_PARM_DESC(dvb, "Register the DVB-T/C frontend (DRX-K + TDA18271): 1 = on");
+
+static char *drxk_fw;
+module_param(drxk_fw, charp, 0444);
+MODULE_PARM_DESC(drxk_fw, "DRX-K microcode file to load (default: none, use the chip's ROM code)");
+
+DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
+
+static int drxk_parallel;
+module_param(drxk_parallel, int, 0444);
+MODULE_PARM_DESC(drxk_parallel, "DRX-K transport stream output: 0 = serial (default), 1 = parallel");
+
+/*
+ * Debug: read-only sysfs files exposing the DMA buffers, so register-level
+ * experiments (e.g. finding the TS DMA route) can be run from user space
+ * with tm62reg. Off by default.
+ */
+static int debug_sysfs;
+module_param(debug_sysfs, int, 0444);
+MODULE_PARM_DESC(debug_sysfs, "Expose dbg_pt / dbg_hwbuf sysfs files for DMA experiments");
 
 #define PCI_VENDOR_ID_TRIDENT_TM62	0x1a0a
 #define PCI_DEVICE_ID_TRIDENT_TM6200	0x6200
@@ -239,7 +280,8 @@ struct avertm62_dev {
 	u32			sizeimage;
 	bool			interlaced;
 	u32			fps;
-	u32			input;		/* 0 = HDMI, 1 = Component */
+	u32			input;		/* AVERTM62_INPUT_* */
+	u32			field_count;	/* composite: fields woven into the current frame */
 	int			active_pattern;	/* test_pattern latched at stream start, -1 = live */
 
 	/* Streaming & DMA state */
@@ -256,6 +298,12 @@ struct avertm62_dev {
 	struct avertm62_hw_buf	hw_bufs[AVERTM62_HW_BUFS];
 	u32			hw_push_idx;
 	struct timer_list	fallback_timer;
+
+	/* Digital TV */
+	struct dvb_adapter	dvb_adap;
+	struct dvb_frontend	*fe;
+	bool			dvb_adap_registered;
+	bool			dvb_fe_registered;
 };
 
 /* MMIO helpers */
@@ -1092,6 +1140,12 @@ static void avertm62_push_hw_buf_ch(struct avertm62_dev *dev, u32 idx, int ch)
 {
 	struct avertm62_hw_buf *hb = &dev->hw_bufs[idx % AVERTM62_HW_BUFS];
 	u32 pt_pfn = (u32)(hb->pt_dma >> 12) & 0xfffffU;
+	/*
+	 * Always size the buffer for a whole frame. On HDMI the TM6202 weaves
+	 * both fields into it; on composite it still closes the buffer at the
+	 * end of each field, but a buffer sized exactly one field long loses
+	 * every other field (27 instead of 50 fields/s).
+	 */
 	u32 len = (dev->bytesperline * dev->height) & 0x007fffffU;
 	u32 fifo = tm62_vid_ch_base[ch] + 0x200;
 
@@ -1119,6 +1173,34 @@ static void avertm62_copy_hw_to_vb2(struct avertm62_dev *dev,
 		out += chunk;
 		rem -= chunk;
 		p++;
+	}
+}
+
+/* Copy one field into every other line of the frame (field 0 = even lines) */
+static void avertm62_copy_hw_field(struct avertm62_dev *dev,
+				   struct avertm62_hw_buf *hb,
+				   u8 *dst, u32 field)
+{
+	u32 bpl = dev->bytesperline;
+	u32 lines = dev->height / 2;
+	u32 src_off = 0, y;
+
+	for (y = 0; y < lines; y++) {
+		u8 *line_dst = dst + (y * 2 + (field & 1)) * bpl;
+		u32 rem = bpl;
+
+		while (rem > 0) {
+			u32 p = src_off >> PAGE_SHIFT;
+			u32 pg_off = src_off & (PAGE_SIZE - 1);
+			u32 chunk = min_t(u32, rem, PAGE_SIZE - pg_off);
+
+			if (p >= hb->num_pages)
+				return;
+			memcpy(line_dst, (u8 *)hb->page_cpu[p] + pg_off, chunk);
+			line_dst += chunk;
+			src_off += chunk;
+			rem -= chunk;
+		}
 	}
 }
 
@@ -1176,7 +1258,8 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		      (clk_src >= 0 && clk_src <= 7) ? clk_src :
 		      (dev->active_pattern >= 0 ? 0 : 1));
 
-	if (dev->input == 0) {
+	if (dev->input == AVERTM62_INPUT_HDMI ||
+	    dev->input == AVERTM62_INPUT_COMPOSITE) {
 		/* RMW only (Windows uses bitfield writes): keep power-on default bits 0x00060200 */
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 0, 1, 1);
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 1, 1, 0);
@@ -1190,7 +1273,8 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		tm62_write_bf(dev, TM62_REG_STREAM_ROUTE, 0, 16, 0);
 		tm62_write32(dev, TM62_REG_CH1_VID_TIMING_CFG, 0);
 
-		if (dev->hdmi_chip == HDMI_CHIP_SII9011) {
+		if (dev->input == AVERTM62_INPUT_HDMI &&
+		    dev->hdmi_chip == HDMI_CHIP_SII9011) {
 			sii9011_configure_regs(dev);
 			tm62_i2c_write_reg8(dev, 0, 0x60, 0x08, 0x07);
 			tm62_i2c_write_reg8(dev, 0, 0x68, 0x3e, SII9011_PD_RUN);
@@ -1278,8 +1362,11 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 	fmt_cfg = BIT(30) |
 		  (((dev->pixelformat == V4L2_PIX_FMT_UYVY) ? 1U : 0U) << 24) |
 		  BIT(22) |
-		  ((dev->interlaced ? 0U : 1U) << 20) |
-		  ((dev->input == 0) ? BIT(18) : 0U) |
+		  /* [20]=1 hands every field to DMA separately; composite needs it,
+		   * otherwise the engine drops every other field */
+		  ((dev->interlaced && dev->input != AVERTM62_INPUT_COMPOSITE) ?
+		   0U : 1U) << 20 |
+		  ((dev->input == AVERTM62_INPUT_HDMI) ? BIT(18) : 0U) |
 		  (2U << 16);
 	tm62_write32(dev, TM62_REG_CH1_FMT_CFG, fmt_cfg);
 
@@ -1326,13 +1413,43 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 1, 1, 0);
 
 	/* 8. Start Video Capture Gate on Channel 1 (0x4f57f: 0x0190[6]=1) */
-	if (dev->input != 0) {
+	if (dev->input != AVERTM62_INPUT_HDMI &&
+	    dev->input != AVERTM62_INPUT_COMPOSITE) {
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 5, 2, 0);
 		udelay(10);
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 5, 2, 3);
 	} else {
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 5, 1, 0);
 		tm62_write_bf(dev, TM62_REG_VID_ROUTE, 6, 1, 1);
+	}
+
+	if (dev->input == AVERTM62_INPUT_COMPOSITE) {
+		/*
+		 * Route the breakout socket's composite input through the TM6202
+		 * internal decoder to DMA engine 1 (found by live testing; see
+		 * HARDWARE.md). 0x0494[19:18] is already 0 from fmt_cfg above.
+		 */
+		tm62_write_bf(dev, 0x0290, 26, 2, 1);	/* analog mux into decoder */
+		/*
+		 * Windows' decoder start routine (0x11740) sets these. Without them
+		 * the decoder never sees the input (status frozen, flat grey picture).
+		 */
+		tm62_write_bf(dev, 0x029c, 7, 1, 1);
+		tm62_write_bf(dev, 0x029c, 6, 1, 1);
+		tm62_write_bf(dev, 0x0000, 0, 1, 0);	/* Windows 0x537fc, analog ports */
+		/*
+		 * Decoder input select: Windows' PAL table value (1). Value 4 also
+		 * produces a picture but with a strong echo 7 px to the right and
+		 * the chroma demodulator pinned to the rails.
+		 */
+		tm62_write_bf(dev, 0x0000, 1, 3, 1);
+		/*
+		 * Contrast: the table default (0x7e) clips about 60% of a normal
+		 * picture to white on this input; 0x40 keeps it in range.
+		 */
+		tm62_write_bf(dev, 0x0008, 0, 8, 0x40);
+		tm62_write32(dev, TM62_REG_CH0_CROP_H, 0x02d00120);	/* 720x288 */
+		tm62_write32(dev, TM62_REG_CH0_CROP_V, 0x02d00120);
 	}
 
 	dev_info(&dev->pdev->dev,
@@ -1489,7 +1606,15 @@ static bool avertm62_poll_dma_slots(struct avertm62_dev *dev)
 							struct avertm62_vb2_buf, list);
 				vaddr = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
 
-				if (vaddr) {
+				if (dev->input == AVERTM62_INPUT_COMPOSITE) {
+					/* One field per slot: weave pairs into a frame */
+					if (vaddr)
+						avertm62_copy_hw_field(dev, &dev->hw_bufs[b_idx],
+								       vaddr, dev->field_count);
+					if (++dev->field_count < 2)
+						goto requeue;
+					dev->field_count = 0;
+				} else if (vaddr) {
 					u32 bpl = dev->bytesperline;
 					u32 off;
 
@@ -1506,11 +1631,13 @@ static bool avertm62_poll_dma_slots(struct avertm62_dev *dev)
 						      dev->sizeimage);
 				vbuf->vb.vb2_buf.timestamp = ktime_get_ns();
 				vbuf->vb.sequence = dev->sequence++;
-				vbuf->vb.field = V4L2_FIELD_NONE;
+				vbuf->vb.field = dev->interlaced ? V4L2_FIELD_INTERLACED :
+								   V4L2_FIELD_NONE;
 				vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 				dev->dma_frame_count++;
 			}
 		}
+requeue:
 
 		avertm62_push_hw_buf_ch(dev, b_idx, chan);
 	}
@@ -1667,7 +1794,9 @@ static int avertm62_start_streaming(struct vb2_queue *vq, unsigned int count)
 			dev_warn(&dev->pdev->dev,
 				 "test_pattern: format is %ux%u, expected 720x576\n",
 				 dev->width, dev->height);
-	} else if (dev->input == 0) {
+	} else if (dev->input == AVERTM62_INPUT_COMPOSITE) {
+		dev->interlaced = true;
+	} else if (dev->input == AVERTM62_INPUT_HDMI) {
 		bool locked = avertm62_detect_hdmi_timings(dev, &det_w, &det_h,
 							   &det_inter);
 		dev_info(&dev->pdev->dev,
@@ -1683,6 +1812,7 @@ static int avertm62_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	spin_lock_irqsave(&dev->qlock, flags);
 	dev->sequence = 0;
+	dev->field_count = 0;
 	dev->cur_frame_bytes = 0;
 	dev->cur_slice_mask = 0;
 	dev->streaming = true;
@@ -1755,7 +1885,8 @@ static int avertm62_g_fmt_vid_cap(struct file *file, void *priv,
 
 	f->fmt.pix.width        = dev->width;
 	f->fmt.pix.height       = dev->height;
-	f->fmt.pix.field        = V4L2_FIELD_NONE;
+	f->fmt.pix.field        = (dev->input == AVERTM62_INPUT_COMPOSITE) ?
+				  V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 	f->fmt.pix.pixelformat  = dev->pixelformat;
 	f->fmt.pix.bytesperline = dev->bytesperline;
 	f->fmt.pix.sizeimage    = dev->sizeimage;
@@ -1766,18 +1897,26 @@ static int avertm62_g_fmt_vid_cap(struct file *file, void *priv,
 static int avertm62_try_fmt_vid_cap(struct file *file, void *priv,
 				    struct v4l2_format *f)
 {
+	struct avertm62_dev *dev = video_drvdata(file);
 	u32 w = f->fmt.pix.width;
 	u32 h = f->fmt.pix.height;
 
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_UYVY)
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
 
-	w = clamp_t(u32, ALIGN(w, 2), 640, AVERTM62_MAX_WIDTH);
-	h = clamp_t(u32, ALIGN(h, 2), 480, AVERTM62_MAX_HEIGHT);
+	if (dev->input == AVERTM62_INPUT_COMPOSITE) {
+		/* The decoder output size is fixed (no scaler support yet) */
+		w = AVERTM62_PAL_WIDTH;
+		h = AVERTM62_PAL_HEIGHT;
+	} else {
+		w = clamp_t(u32, ALIGN(w, 2), 640, AVERTM62_MAX_WIDTH);
+		h = clamp_t(u32, ALIGN(h, 2), 480, AVERTM62_MAX_HEIGHT);
+	}
 
 	f->fmt.pix.width        = w;
 	f->fmt.pix.height       = h;
-	f->fmt.pix.field        = V4L2_FIELD_NONE;
+	f->fmt.pix.field        = (dev->input == AVERTM62_INPUT_COMPOSITE) ?
+				  V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 	f->fmt.pix.bytesperline = w * 2;
 	f->fmt.pix.sizeimage    = w * h * 2;
 	f->fmt.pix.colorspace   = V4L2_COLORSPACE_REC709;
@@ -1827,9 +1966,10 @@ static int avertm62_enum_input(struct file *file, void *priv,
 		if (!avertm62_detect_hdmi_timings(dev, &w, &h, &inter))
 			inp->status = V4L2_IN_ST_NO_SIGNAL | V4L2_IN_ST_NO_SYNC;
 		return 0;
-	case 1:
-		strscpy(inp->name, "Component (YPbPr)", sizeof(inp->name));
+	case AVERTM62_INPUT_COMPOSITE:
+		strscpy(inp->name, "Composite", sizeof(inp->name));
 		inp->type = V4L2_INPUT_TYPE_CAMERA;
+		inp->std = V4L2_STD_PAL;
 		return 0;
 	default:
 		return -EINVAL;
@@ -1848,15 +1988,31 @@ static int avertm62_s_input(struct file *file, void *priv, unsigned int i)
 {
 	struct avertm62_dev *dev = video_drvdata(file);
 
-	if (i > 1)
+	if (i >= AVERTM62_NUM_INPUTS)
 		return -EINVAL;
+	if (i == dev->input)
+		return 0;
+	if (vb2_is_busy(&dev->vb2_q))
+		return -EBUSY;
+
 	dev->input = i;
+	if (i == AVERTM62_INPUT_COMPOSITE) {
+		dev->width = AVERTM62_PAL_WIDTH;
+		dev->height = AVERTM62_PAL_HEIGHT;
+		dev->interlaced = true;
+	} else {
+		dev->width = AVERTM62_MAX_WIDTH;
+		dev->height = AVERTM62_MAX_HEIGHT;
+	}
+	dev->bytesperline = dev->width * 2;
+	dev->sizeimage = dev->bytesperline * dev->height;
 	return 0;
 }
 
 static int avertm62_enum_framesizes(struct file *file, void *priv,
 				    struct v4l2_frmsizeenum *fsize)
 {
+	struct avertm62_dev *dev = video_drvdata(file);
 	static const struct { u32 w; u32 h; } sizes[] = {
 		{ 1920, 1080 },
 		{ 1280,  720 },
@@ -1868,6 +2024,14 @@ static int avertm62_enum_framesizes(struct file *file, void *priv,
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV &&
 	    fsize->pixel_format != V4L2_PIX_FMT_UYVY)
 		return -EINVAL;
+	if (dev->input == AVERTM62_INPUT_COMPOSITE) {
+		if (fsize->index > 0)
+			return -EINVAL;
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = AVERTM62_PAL_WIDTH;
+		fsize->discrete.height = AVERTM62_PAL_HEIGHT;
+		return 0;
+	}
 	if (fsize->index >= ARRAY_SIZE(sizes))
 		return -EINVAL;
 
@@ -1888,7 +2052,9 @@ static int avertm62_enum_frameintervals(struct file *file, void *priv,
 
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	fival->discrete.numerator = 1;
-	fival->discrete.denominator = 60;
+	fival->discrete.denominator =
+		(((struct avertm62_dev *)video_drvdata(file))->input ==
+		 AVERTM62_INPUT_COMPOSITE) ? 25 : 30;
 	return 0;
 }
 
@@ -1901,7 +2067,9 @@ static int avertm62_g_parm(struct file *file, void *priv,
 	sp->parm.capture.capability   = V4L2_CAP_TIMEPERFRAME;
 	sp->parm.capture.readbuffers  = 4;
 	sp->parm.capture.timeperframe.numerator   = 1;
-	sp->parm.capture.timeperframe.denominator = 60;
+	sp->parm.capture.timeperframe.denominator =
+		(((struct avertm62_dev *)video_drvdata(file))->input ==
+		 AVERTM62_INPUT_COMPOSITE) ? 25 : 30;
 	return 0;
 }
 
@@ -2017,6 +2185,114 @@ static const struct v4l2_file_operations avertm62_fops = {
 	.unlocked_ioctl = video_ioctl2,
 	.mmap           = vb2_fop_mmap,
 };
+
+/* --- debug sysfs: DMA buffer page tables and contents --- */
+static ssize_t dbg_pt_show(struct device *d, struct device_attribute *attr, char *buf)
+{
+	struct avertm62_dev *dev = pci_get_drvdata(to_pci_dev(d));
+	ssize_t n = 0;
+	int i;
+
+	for (i = 0; i < AVERTM62_HW_BUFS; i++)
+		n += sysfs_emit_at(buf, n, "%d 0x%05llx %u\n", i,
+				   (unsigned long long)(dev->hw_bufs[i].pt_dma >> 12),
+				   dev->hw_bufs[i].num_pages);
+	return n;
+}
+static DEVICE_ATTR_RO(dbg_pt);
+
+static ssize_t dbg_hwbuf_read(struct file *f, struct kobject *kobj,
+			      const struct bin_attribute *attr, char *buf,
+			      loff_t off, size_t count)
+{
+	struct avertm62_dev *dev = pci_get_drvdata(to_pci_dev(kobj_to_dev(kobj)));
+	const loff_t per_buf = (loff_t)AVERTM62_PT_PAGES * PAGE_SIZE;
+	size_t done = 0;
+
+	while (done < count) {
+		loff_t pos = off + done;
+		int b = pos / per_buf;
+		loff_t in = pos % per_buf;
+		int pg = in >> PAGE_SHIFT;
+		size_t po = in & (PAGE_SIZE - 1);
+		size_t chunk = min_t(size_t, count - done, PAGE_SIZE - po);
+
+		if (b >= AVERTM62_HW_BUFS || pg >= dev->hw_bufs[b].num_pages)
+			break;
+		memcpy(buf + done, (u8 *)dev->hw_bufs[b].page_cpu[pg] + po, chunk);
+		done += chunk;
+	}
+	return done;
+}
+static const struct bin_attribute bin_attr_dbg_hwbuf = {
+	.attr = { .name = "dbg_hwbuf", .mode = 0444 },
+	.size = (loff_t)AVERTM62_HW_BUFS * AVERTM62_PT_PAGES * PAGE_SIZE,
+	.read_new = dbg_hwbuf_read,
+};
+
+static void avertm62_dvb_exit(struct avertm62_dev *dev)
+{
+	if (dev->dvb_fe_registered)
+		dvb_unregister_frontend(dev->fe);
+	if (dev->fe)
+		dvb_frontend_detach(dev->fe);
+	if (dev->dvb_adap_registered)
+		dvb_unregister_adapter(&dev->dvb_adap);
+	dev->fe = NULL;
+	dev->dvb_fe_registered = false;
+	dev->dvb_adap_registered = false;
+}
+
+static int avertm62_dvb_init(struct avertm62_dev *dev)
+{
+	struct drxk_config drxk_cfg = {
+		.adr = 0x29,		/* 8-bit 0x52 */
+		.no_i2c_bridge = true,	/* tuner answers with the DRX-K held in reset */
+		.chunk_size = 56,
+		.microcode_name = drxk_fw,
+		.parallel_ts = !!drxk_parallel,
+	};
+	static struct tda18271_config tda_cfg = {
+		.gate = TDA18271_GATE_AUTO,
+	};
+	struct i2c_adapter *i2c = &dev->i2c_bus[0].adap;
+	int ret;
+
+	/* Pulse the DRX-K reset (INF: "GPIO Reset Demodulator" = 5) */
+	tm62_gpio_dir(dev, 5, true);
+	tm62_gpio_set(dev, 5, false);
+	msleep(20);
+	tm62_gpio_set(dev, 5, true);
+	msleep(100);
+
+	ret = dvb_register_adapter(&dev->dvb_adap, "AVerMedia H727", THIS_MODULE,
+				   &dev->pdev->dev, adapter_nr);
+	if (ret < 0)
+		return ret;
+	dev->dvb_adap_registered = true;
+
+	dev->fe = dvb_attach(drxk_attach, &drxk_cfg, i2c);
+	if (!dev->fe) {
+		dev_err(&dev->pdev->dev, "DRX-K demodulator attach failed\n");
+		ret = -ENODEV;
+		goto err;
+	}
+	if (!dvb_attach(tda18271_attach, dev->fe, 0x60, i2c, &tda_cfg)) {
+		dev_err(&dev->pdev->dev, "TDA18271 tuner attach failed\n");
+		ret = -ENODEV;
+		goto err;
+	}
+	ret = dvb_register_frontend(&dev->dvb_adap, dev->fe);
+	if (ret < 0)
+		goto err;
+	dev->dvb_fe_registered = true;
+	dev_info(&dev->pdev->dev, "DVB frontend registered (DRX-K + TDA18271)\n");
+	return 0;
+
+err:
+	avertm62_dvb_exit(dev);
+	return ret;
+}
 
 static void avertm62_probe_i2c_and_hdmi(struct avertm62_dev *dev)
 {
@@ -2170,6 +2446,15 @@ static int avertm62_pci_probe(struct pci_dev *pdev,
 	pci_set_drvdata(pdev, dev);
 	dev_info(&pdev->dev, "Registered V4L2 capture device %s\n",
 		 video_device_node_name(vdev));
+
+	if (debug_sysfs) {
+		if (device_create_file(&pdev->dev, &dev_attr_dbg_pt) ||
+		    device_create_bin_file(&pdev->dev, &bin_attr_dbg_hwbuf))
+			dev_warn(&pdev->dev, "debug sysfs files not created\n");
+	}
+
+	if (dvb && avertm62_dvb_init(dev) < 0)
+		dev_warn(&pdev->dev, "DVB frontend not available; analog capture still works\n");
 	return 0;
 
 err_unreg_v4l2:
@@ -2199,6 +2484,11 @@ static void avertm62_pci_remove(struct pci_dev *pdev)
 	avertm62_hw_stop_streaming(dev);
 	tm62_write32(dev, TM62_REG_IRQ_MASK, TM62_IRQ_MASK_ALL);
 
+	if (debug_sysfs) {
+		device_remove_bin_file(&pdev->dev, &bin_attr_dbg_hwbuf);
+		device_remove_file(&pdev->dev, &dev_attr_dbg_pt);
+	}
+	avertm62_dvb_exit(dev);
 	video_unregister_device(&dev->vdev);
 	v4l2_device_unregister(&dev->v4l2_dev);
 	free_irq(pci_irq_vector(pdev, 0), dev);
