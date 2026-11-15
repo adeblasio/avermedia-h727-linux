@@ -64,6 +64,41 @@ Decoder picture and colour controls (confirmed by capture):
 | `0x0004[28]` | Replaces the picture with a solid blue background |
 | `0x0018` + `0x0020[31:24]` | Colour subcarrier word 0x2a098acb = exactly 4.43361875 MHz (PAL) at a 27 MHz decoder clock |
 
+### The analog decoder is a Trident TM6010-family core
+
+Byte n of BAR0 (0x00-0x8F) is the TM6010's video decoder register Rn
+(REQ07 page in the old Linux tm6000 driver, removed after v5.x; see
+`drivers/media/usb/tm6000/tm6000-regs.h` and `tm6000-stds.c` in v5.15).
+Confirmed by: R04 LUMA_HAGC=0xdd, R17 HLOOP_MAXSTATE=0x8b, R31=0xc1 matching
+tm6000's tables exactly, R1C-R1F HSYNC_DTO = 0x20000000 being tm6000's
+0x1ccccccd rescaled from its 30 MHz clock to 27 MHz, and the R70-R7F status
+registers (chroma DTO readback, AGC gains, chroma magnitude) behaving as named.
+
+Useful registers (TM6010 names):
+
+| BAR0 | Rn | Name | Notes |
+|---|---|---|---|
+| 0x0000[7:0] | R00 | VIDEO_CONTROL0 | [3:1] colour standard (tm6000: NTSC 0x01, PAL 0x33, PAL-M 0x05, PAL-N 0x37, SECAM 0x39), [5:4] 625-line. On the TM6202 bit 0 is not tm6000's: setting it removes the picture's colour |
+| 0x0004[31:24] | R07 | OUTPUT_CONTROL | bit 4 = blue background |
+| 0x0008 | R08-R0B | contrast, brightness, saturation, hue | |
+| 0x000c | R0C-R0F | chroma AGC, CHROMA_KILL_LEVEL (R0D bit 7 forces colour on), auto position | |
+| 0x0018 | R18-R1B | CHROMA_DTO_INCREMENT | **must be 0xcb8a092a** (R18 in the low byte) = 4.43361875 MHz at 27 MHz. The driver used to write 0x00cb8a09 + 0x2a in R23 (bytes shifted), putting the colour oscillator at ~1 MHz. Fixed. |
+| 0x001c | R1C-R1F | HSYNC_DTO_INCREMENT | 0x20000000 at 27 MHz |
+| 0x002c | R2C/R2D | CHROMA_BURST_START/END | 0x3a/0x4d (Windows) |
+| 0x0038/0x003c | R38-R3F | VSYNC threshold, STATUS1-3 (R3A-R3C), R3F RESET (0x003c[24]) | Windows' table writes R38/R39/R3D fields the driver used to skip (now added) |
+| 0x0070-0x007c | R70-R7F | HSYNC/CHROMA DTO readback, AGC analog/digital gain, chroma magnitude/gain, CORDIC freq, noise | live diagnostics |
+| 0x0080 | R80-R83 | comb threshold/config, CHROMA_LOCK_CONFIG | |
+
+Colour status after the DTO fix: the colour oscillator runs at exactly
+4.4336 MHz and the decoder measures strong chroma (R7A ~0xee), but colour
+stays killed. Forcing it on (R0D bit 7) gives correct, saturated colours in
+alternating bands: the hue changes ~92 degrees per line (PAL's -90 degree
+per-line subcarrier offset) i.e. the per-line burst phase correction never
+happens, and R3A bit 4 (Windows' "signal present", 0x116cc) never sets.
+Tried without success: every single-bit flip of R00-R03/R0C-R0F/R2C-R2F/
+R30-R33/R80-R8B, a 2D burst-gate sweep, tm6000's R01-R03/R82/R83 values,
+the 0x0294[19]/0x0290[20] bits, clearing the S-Video bits.
+
 Colour-bar measurements (HDMI2AV adapter's own 8-bar test pattern; the
 adapter is sharp and in full colour on a CRT):
 
@@ -141,6 +176,19 @@ The AD9985A is the **component** front end: its 17-register mode table
     defaults to 0). Applying these still delivers nothing on sources 2/3.
   - `0x07a0[6]=1` resets the DMA completion slots (Windows sets it when all
     streams are idle).
+  - Windows configures the DRX-K TS output itself (Micronas reference code,
+    0x1c9a4 init / 0x21c80 polarity / 0x217f0 DTO): all polarity inverts 0
+    (same as the kernel driver), parallel mode chosen from the source's
+    settings (INF "DTV Source Type" = 1, so almost certainly parallel).
+  - Tested with ABC locked, parallel TS: sources 1/2/3 on channels
+    0x300/0x400 deliver nothing even with the HDMI receiver's outputs
+    powered down (`0x68:0x3e=0xd0`).
+  - Toggling GPIO4, GPIO6 or GPIO7 makes the demodulator lose lock (GPIO7 is
+    the INF's "SiI9011 reset" but evidently also disturbs the tuner side);
+    a driver reload recovers it.
+  - Windows' TS stream object (vtable 0x102570, ctor at 0x45920, base
+    0x5ff7c) uses engine index 0 by default; the source index it writes to
+    [19:18] comes from a field set outside the constructor (not found yet).
 
 ## Audio (INF)
 

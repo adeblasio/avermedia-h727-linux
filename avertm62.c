@@ -755,12 +755,29 @@ static void tm62_bus_master_init(struct avertm62_dev *dev)
 	tm62_write32(dev, 0x000c, 0x200000b4);
 	tm62_write32(dev, 0x0010, 0x8206b90a);
 	tm62_write32(dev, 0x0014, 0x8b746440);
-	tm62_write32(dev, 0x0018, 0x00cb8a09);
-	tm62_write_bf(dev, 0x0020, 24, 8, 0x2a);
+	/*
+	 * Analog decoder (Trident TM6010-family core; byte n of BAR0 is the
+	 * TM6010's register Rn). 0x0018 = R18..R1B CHROMA_DTO_INCREMENT,
+	 * 0x2a098acb = 4.43361875 MHz (PAL) at the 27 MHz decoder clock, stored
+	 * R18 in the low byte. Windows (0x147d4..0x14814) writes it as the
+	 * fields [5:0]=0x2a [15:8]=0x09 [23:16]=0x8a [31:24]=0xcb. An earlier
+	 * transcription had the bytes shifted by one (0x00cb8a09 plus 0x2a in
+	 * R23), which put the colour oscillator at ~1 MHz.
+	 */
+	tm62_write32(dev, 0x0018, 0xcb8a092a);
 	tm62_write32(dev, 0x0028, 0x4ed64e22);
 	tm62_write32(dev, 0x002c, 0x50804d3a);
 	tm62_write32(dev, 0x0030, 0x0074c12c);
 	tm62_write32(dev, 0x0034, 0x207f906c);
+	/* R38 VSYNC_THRESHOLD / R39 VSYNC_TIME_CONSTANT / R3A, and R3C/R3D, from
+	 * the Windows PAL table (0x14678); previously never written */
+	tm62_write_bf(dev, 0x0038, 0, 6, 0x36);
+	tm62_write_bf(dev, 0x0038, 6, 2, 2);
+	tm62_write_bf(dev, 0x0038, 15, 1, 1);
+	tm62_write_bf(dev, 0x0038, 21, 3, 4);
+	tm62_write_bf(dev, 0x003c, 8, 4, 8);
+	tm62_write_bf(dev, 0x003c, 12, 1, 1);
+	tm62_write_bf(dev, 0x003c, 13, 3, 0);
 
 	tm62_write_bf(dev, 0x0200, 1, 3, 1);
 	tm62_write_bf(dev, 0x0200, 4, 1, 1);
