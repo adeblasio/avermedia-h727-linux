@@ -765,6 +765,15 @@ static void tm62_bus_master_init(struct avertm62_dev *dev)
 	 * R23), which put the colour oscillator at ~1 MHz.
 	 */
 	tm62_write32(dev, 0x0018, 0xcb8a092a);
+	/*
+	 * R23 HSYNC_PLL_END_TIME (0x0020[31:24]). Neither Windows nor tm6000
+	 * program it, but the old shifted DTO write left 0x2a here, and the
+	 * register survives module reloads (and possibly warm reboots). Values
+	 * 0x08-0x30 stop the decoder seeing the colour burst (colour killed,
+	 * hue rotating ~90 deg/line when forced); 0x00 and 0x38-0xf8 all give a
+	 * locked PAL burst on a live signal. Use the middle of the good range.
+	 */
+	tm62_write_bf(dev, 0x0020, 24, 8, 0x80);
 	tm62_write32(dev, 0x0028, 0x4ed64e22);
 	tm62_write32(dev, 0x002c, 0x50804d3a);
 	tm62_write32(dev, 0x0030, 0x0074c12c);
@@ -1460,11 +1469,8 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		 * the chroma demodulator pinned to the rails.
 		 */
 		tm62_write_bf(dev, 0x0000, 1, 3, 1);
-		/*
-		 * Contrast: the table default (0x7e) clips about 60% of a normal
-		 * picture to white on this input; 0x40 keeps it in range.
-		 */
-		tm62_write_bf(dev, 0x0008, 0, 8, 0x40);
+		/* Contrast: Windows' table default (0x7e) gives standard 16-235 levels */
+		tm62_write_bf(dev, 0x0008, 0, 8, 0x7e);
 		tm62_write32(dev, TM62_REG_CH0_CROP_H, 0x02d00120);	/* 720x288 */
 		tm62_write32(dev, TM62_REG_CH0_CROP_V, 0x02d00120);
 	}

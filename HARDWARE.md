@@ -89,7 +89,20 @@ Useful registers (TM6010 names):
 | 0x0070-0x007c | R70-R7F | HSYNC/CHROMA DTO readback, AGC analog/digital gain, chroma magnitude/gain, CORDIC freq, noise | live diagnostics |
 | 0x0080 | R80-R83 | comb threshold/config, CHROMA_LOCK_CONFIG | |
 
-Colour status after the DTO fix: the colour oscillator runs at exactly
+**Composite colour works** (2026-11-16): two bugs, both from one bad
+transcription of the Windows table:
+
+1. `0x0018` (R18-R1B chroma DTO) had its bytes shifted; must be `0xcb8a092a`.
+2. The shifted write also put `0x2a` into R23 HSYNC_PLL_END_TIME
+   (`0x0020[31:24]`). Values 0x08-0x30 there stop the decoder seeing the
+   colour burst; 0x00 and 0x38-0xf8 all lock. The driver now writes 0x80.
+   The register survives module reloads, so it must be written explicitly.
+
+With both fixed the decoder releases its colour killer by itself (R3A goes
+0x04 -> 0x0e, burst bit set), hue is stable line to line, and Windows'
+default contrast (0x7e) gives standard levels (white 236, black 20).
+
+Historical notes from before the fix: the colour oscillator ran at exactly
 4.4336 MHz and the decoder measures strong chroma (R7A ~0xee), but colour
 stays killed. Forcing it on (R0D bit 7) gives correct, saturated colours in
 alternating bands: the hue changes ~92 degrees per line (PAL's -90 degree
