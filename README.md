@@ -97,6 +97,12 @@ multiplex frequencies (and `--bw 8` outside Australia) to use it elsewhere.
 - Any write to the TM6202 GPIO registers resets the HDMI receiver; the driver
   reconfigures it when HDMI video starts.
 
+## Credits
+
+Written by [adeblasio](https://github.com/adeblasio), with reverse-engineering
+and coding help from the AI assistants Claude (Anthropic) and Antigravity
+(Google).
+
 ## Legal
 
 This is an independent project, not affiliated with or endorsed by AVerMedia,

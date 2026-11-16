@@ -3257,6 +3257,6 @@ static struct pci_driver avertm62_pci_driver = {
 module_pci_driver(avertm62_pci_driver);
 
 MODULE_DESCRIPTION("AVerMedia H727 / C027 (Trident TM6202) PCIe HDMI Capture V4L2 Driver");
-MODULE_AUTHOR("Antigravity Reverse Engineering");
+MODULE_AUTHOR("adeblasio <357163257+adeblasio@users.noreply.github.com>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(DRV_VERSION);
