@@ -28,6 +28,10 @@
 #include <media/videobuf2-vmalloc.h>
 #include <media/dvb_frontend.h>
 #include <media/dvbdev.h>
+#include <media/dvb_demux.h>
+#include <media/dmxdev.h>
+#include <sound/core.h>
+#include <sound/pcm.h>
 #include "kheaders/drxk.h"
 #include "kheaders/tda18271.h"
 
@@ -85,12 +89,16 @@ MODULE_PARM_DESC(str_route, "Set 0x019c[21:20,17:16] TS/audio route bits (0 = cl
 /*
  * Digital TV (DVB-T/C): Micronas DRX-K demodulator (I2C0 0x52, reset on
  * GPIO5) + NXP TDA18271C2 tuner (I2C0 0xc0, directly on the bus, not behind
- * the DRX-K I2C gate). Board settings from the Windows INF. Off by default
- * while the transport-stream DMA path is still being worked out.
+ * the DRX-K I2C gate). Board settings from the Windows INF. The transport
+ * stream reaches DMA engine 0 (see avertm62_ts_hw_start()).
  */
-static int dvb;
+static int dvb = 1;
 module_param(dvb, int, 0444);
-MODULE_PARM_DESC(dvb, "Register the DVB-T/C frontend (DRX-K + TDA18271): 1 = on");
+MODULE_PARM_DESC(dvb, "Register the DVB-T/C tuner, demux and dvr devices: 1 = on (default), 0 = off");
+
+static int audio = 1;
+module_param(audio, int, 0444);
+MODULE_PARM_DESC(audio, "Register the ALSA capture device for HDMI audio: 1 = on (default), 0 = off");
 
 static char *drxk_fw;
 module_param(drxk_fw, charp, 0444);
@@ -100,7 +108,11 @@ DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
 static int drxk_parallel;
 module_param(drxk_parallel, int, 0444);
-MODULE_PARM_DESC(drxk_parallel, "DRX-K transport stream output: 0 = serial (default), 1 = parallel");
+MODULE_PARM_DESC(drxk_parallel, "DRX-K transport stream output: 0 = serial (default, as wired on the H727), 1 = parallel");
+
+static int static_ts_clk;
+module_param(static_ts_clk, int, 0444);
+MODULE_PARM_DESC(static_ts_clk, "DRX-K TS clock: 0 = dynamic (default), 1 = static (kernel drxk: 50 Mbit/s)");
 
 /*
  * Debug: read-only sysfs files exposing the DMA buffers, so register-level
@@ -225,11 +237,41 @@ MODULE_PARM_DESC(debug_sysfs, "Expose dbg_pt / dbg_hwbuf sysfs files for DMA exp
 
 /* Number of pre-allocated 4MB hardware scatter-gather page-table buffers */
 #define AVERTM62_HW_BUFS		8
+/* debug_sysfs adds one more buffer that no stream uses, for DMA experiments */
+#define AVERTM62_ALL_BUFS		(AVERTM62_HW_BUFS + 1)
 #define AVERTM62_BUFS_PER_CH		4
 #define AVERTM62_MAX_WIDTH		1920
 #define AVERTM62_MAX_HEIGHT		1080
 #define AVERTM62_MAX_FRAME_SIZE		(AVERTM62_MAX_WIDTH * AVERTM62_MAX_HEIGHT * 2)
 #define AVERTM62_PT_PAGES		1024	/* 1024 * 4KB = 4MB per HW buffer */
+
+/*
+ * Transport stream DMA (engine 0): Windows transfers 312 packets (0xe520
+ * bytes) per descriptor. Eight descriptors give ~180 ms of slack at 20 Mbit/s.
+ */
+#define AVERTM62_TS_BUFS		8
+#define AVERTM62_TS_PKTS		312
+#define AVERTM62_TS_BYTES		(AVERTM62_TS_PKTS * 188)
+#define AVERTM62_TS_PAGES		DIV_ROUND_UP(AVERTM62_TS_BYTES, PAGE_SIZE)
+
+/*
+ * HDMI audio: engine 1's audio DMA channel (0x0460, FIFO 0x0660). It closes
+ * one descriptor per video frame (48 kHz stereo S16: 6400 bytes at 30 fps),
+ * so the buffers only need to hold one frame's worth; they reuse the TS
+ * buffer layout (15 pages).
+ */
+#define AVERTM62_AUD_BUFS		8
+#define AVERTM62_AUD_BYTES		(AVERTM62_TS_PAGES * PAGE_SIZE)
+#define TM62_REG_AUD1_DMA_CFG		0x0460	/* [24] rst, [31] enable */
+#define TM62_REG_AUD1_SLOT0_STS		0x0464	/* [21:0] bytes, [31:24] count */
+#define TM62_REG_AUD1_SLOT0_PTA		0x0478
+#define TM62_REG_AUD1_DESC_CTRL		0x0660	/* [22:0] bytes, [30] run, [31] push */
+#define TM62_REG_AUD1_DESC_PTA		0x0664
+#define TM62_REG_AUD1_FIFO_CNT		0x0668
+#define TM62_REG_AUD1_FIFO_RST		0x066c
+/* 0x0494[17:16]: audio source of engine 1's audio channel (found by testing):
+ * 0/1 = the two I2S inputs (1 = SiI9011 HDMI audio), 2 = none, 3 = silence */
+#define AVERTM62_AUD_SRC_HDMI		1
 
 enum avertm62_hdmi_chip {
 	HDMI_CHIP_NONE = 0,
@@ -243,6 +285,13 @@ struct avertm62_hw_buf {
 	void			*page_cpu[AVERTM62_PT_PAGES];
 	dma_addr_t		page_dma[AVERTM62_PT_PAGES];
 	u32			num_pages;
+};
+
+struct avertm62_ts_buf {
+	u32			*pt_cpu;
+	dma_addr_t		pt_dma;
+	void			*page_cpu[AVERTM62_TS_PAGES];
+	dma_addr_t		page_dma[AVERTM62_TS_PAGES];
 };
 
 struct avertm62_vb2_buf {
@@ -295,7 +344,7 @@ struct avertm62_dev {
 	u32			last_s0_pta[2];
 	int			active_dma_ch;
 	struct list_head	buf_list;
-	struct avertm62_hw_buf	hw_bufs[AVERTM62_HW_BUFS];
+	struct avertm62_hw_buf	hw_bufs[AVERTM62_ALL_BUFS];
 	u32			hw_push_idx;
 	struct timer_list	fallback_timer;
 
@@ -304,6 +353,34 @@ struct avertm62_dev {
 	struct dvb_frontend	*fe;
 	bool			dvb_adap_registered;
 	bool			dvb_fe_registered;
+	struct dvb_demux	demux;
+	struct dmxdev		dmxdev;
+	bool			dvb_demux_registered;
+	bool			dvb_dmxdev_registered;
+	struct mutex		ts_mutex;	/* serialises feed start/stop */
+	int			ts_feeds;
+	bool			ts_running;	/* engine 0 owned by the TS path */
+	u32			ts_last_pta;
+	u32			ts_buffers_done;
+	u32			ts_missed;
+	u32			ts_short;	/* descriptors closed before full */
+	u32			ts_badsync;	/* packets not starting with 0x47 */
+	u32			ts_polls;
+	u32			ts_slot_irqs;
+	struct avertm62_ts_buf	ts_bufs[AVERTM62_TS_BUFS];
+
+	/* ALSA HDMI audio capture (engine 1 audio channel) */
+	struct snd_card		*snd_card;
+	struct snd_pcm_substream *aud_ss;
+	struct avertm62_ts_buf	aud_bufs[AVERTM62_AUD_BUFS];
+	bool			aud_running;
+	bool			aud_elapsed;	/* call period_elapsed after the IRQ */
+	u32			aud_last_pta;
+	u32			aud_pos;	/* write position in the ALSA buffer, bytes */
+	u32			aud_period_acc;
+	u32			aud_frames_done;
+
+	spinlock_t		irq_lock;	/* IRQ handler vs. TS mask changes */
 };
 
 /* MMIO helpers */
@@ -1105,7 +1182,7 @@ static void avertm62_free_hw_bufs(struct avertm62_dev *dev)
 {
 	int i, p;
 
-	for (i = 0; i < AVERTM62_HW_BUFS; i++) {
+	for (i = 0; i < AVERTM62_ALL_BUFS; i++) {
 		struct avertm62_hw_buf *hb = &dev->hw_bufs[i];
 
 		for (p = 0; p < hb->num_pages; p++) {
@@ -1128,7 +1205,7 @@ static int avertm62_alloc_hw_bufs(struct avertm62_dev *dev)
 {
 	int i, p;
 
-	for (i = 0; i < AVERTM62_HW_BUFS; i++) {
+	for (i = 0; i < (debug_sysfs ? AVERTM62_ALL_BUFS : AVERTM62_HW_BUFS); i++) {
 		struct avertm62_hw_buf *hb = &dev->hw_bufs[i];
 
 		hb->pt_cpu = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE,
@@ -1145,6 +1222,9 @@ static int avertm62_alloc_hw_bufs(struct avertm62_dev *dev)
 			if (!vaddr)
 				goto err_free;
 
+			/* debug: a marker fill shows which bytes DMA wrote */
+			if (debug_sysfs)
+				memset(vaddr, 0xaa, PAGE_SIZE);
 			hb->page_cpu[p] = vaddr;
 			hb->page_dma[p] = daddr;
 			hb->pt_cpu[p] = cpu_to_le32((u32)(daddr & ~0xfffULL));
@@ -1232,10 +1312,14 @@ static void avertm62_copy_hw_field(struct avertm62_dev *dev,
 
 static void avertm62_dma_fifo_reset(struct avertm62_dev *dev)
 {
-	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 1);
+	bool eng0 = !dev->ts_running;	/* engine 0 carries the TS when tuned */
+
+	if (eng0)
+		tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 1);
 	tm62_write_bf(dev, TM62_REG_DMA_START, 0, 1, 1);
 	udelay(10);
-	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 0);
+	if (eng0)
+		tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 0);
 	tm62_write_bf(dev, TM62_REG_DMA_START, 0, 1, 0);
 }
 
@@ -1380,9 +1464,11 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 	 *    - 0x0494[25:24] = pixfmt (0x5c0cc: 0=YUYV, 1=UYVY)
 	 *    - 0x0494[30]    = 1 (power-on default 0x40470000)
 	 */
-	tm62_write32(dev, TM62_REG_CH0_DMA_CFG, 0);
-	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
-	tm62_write32(dev, TM62_REG_CH0_FMT_CFG, BIT(31) | BIT(30) | (3U << 16));
+	if (!dev->ts_running) {
+		tm62_write32(dev, TM62_REG_CH0_DMA_CFG, 0);
+		tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
+		tm62_write32(dev, TM62_REG_CH0_FMT_CFG, BIT(31) | BIT(30) | (3U << 16));
+	}
 
 	tm62_write32(dev, TM62_REG_CH1_FRAME_BYTES, 0);
 	fmt_cfg = BIT(30) |
@@ -1393,7 +1479,8 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		  ((dev->interlaced && dev->input != AVERTM62_INPUT_COMPOSITE) ?
 		   0U : 1U) << 20 |
 		  ((dev->input == AVERTM62_INPUT_HDMI) ? BIT(18) : 0U) |
-		  (2U << 16);
+		  /* [17:16] audio source: HDMI I2S for the ALSA device */
+		  (((dev->input == AVERTM62_INPUT_HDMI) ? AVERTM62_AUD_SRC_HDMI : 2U) << 16);
 	tm62_write32(dev, TM62_REG_CH1_FMT_CFG, fmt_cfg);
 
 	/* Disable VBI DMA */
@@ -1497,11 +1584,17 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 
 static void avertm62_hw_stop_streaming(struct avertm62_dev *dev)
 {
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
 	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 20, 1, 1);
 	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 17, 1, 1);
-	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 16, 1, 1);
 	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 1, 1, 1);
-	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 0, 1, 1);
+	if (!dev->ts_running) {
+		tm62_write_bf(dev, TM62_REG_IRQ_MASK, 16, 1, 1);
+		tm62_write_bf(dev, TM62_REG_IRQ_MASK, 0, 1, 1);
+	}
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
 
 	tm62_write_bf(dev, TM62_REG_VID_ROUTE, 6, 1, 0);
 	tm62_write_bf(dev, TM62_REG_PLL_CTRL0, 7, 1, 0);
@@ -1513,18 +1606,20 @@ static void avertm62_hw_stop_streaming(struct avertm62_dev *dev)
 	if (dev->hdmi_chip == HDMI_CHIP_SII9011)
 		tm62_i2c_write_reg8(dev, 0, 0x68, 0x3e, SII9011_PD_IDLE);
 
-	tm62_write_bf(dev, TM62_REG_CH0_DMA_TIMER, 30, 1, 0);
+	if (!dev->ts_running) {
+		tm62_write_bf(dev, TM62_REG_CH0_DMA_TIMER, 30, 1, 0);
+		tm62_write32(dev, TM62_REG_CH0_DMA_CFG, 0);
+		tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
+		tm62_write_bf(dev, TM62_REG_CH0_FMT_CFG, 16, 2, 3);
+		tm62_write_bf(dev, TM62_REG_CH0_FMT_CFG, 31, 1, 1);
+	}
 	tm62_write_bf(dev, TM62_REG_CH1_DMA_TIMER, 30, 1, 0);
-	tm62_write32(dev, TM62_REG_CH0_DMA_CFG, 0);
 	tm62_write32(dev, TM62_REG_CH0_VBI_DMA_CFG, 0);
 	tm62_write32(dev, TM62_REG_CH1_DMA_CFG, 0);
 	tm62_write32(dev, TM62_REG_CH1_VBI_DMA_CFG, 0);
-	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
 	tm62_write_bf(dev, TM62_REG_CH0_VBI_DESC_CTRL, 30, 1, 0);
 	tm62_write_bf(dev, TM62_REG_CH1_DESC_CTRL, 30, 1, 0);
 	tm62_write_bf(dev, TM62_REG_CH1_VBI_DESC_CTRL, 30, 1, 0);
-	tm62_write_bf(dev, TM62_REG_CH0_FMT_CFG, 16, 2, 3);
-	tm62_write_bf(dev, TM62_REG_CH0_FMT_CFG, 31, 1, 1);
 	tm62_write_bf(dev, TM62_REG_CH1_FMT_CFG, 16, 2, 3);
 	tm62_write_bf(dev, TM62_REG_CH1_FMT_CFG, 31, 1, 1);
 
@@ -1533,10 +1628,11 @@ static void avertm62_hw_stop_streaming(struct avertm62_dev *dev)
 }
 
 static bool avertm62_poll_dma_slots(struct avertm62_dev *dev);
+static void avertm62_ts_poll(struct avertm62_dev *dev);
+static void avertm62_aud_poll(struct avertm62_dev *dev);
 
-static irqreturn_t avertm62_irq(int irq, void *dev_id)
+static irqreturn_t avertm62_irq_locked(struct avertm62_dev *dev)
 {
-	struct avertm62_dev *dev = dev_id;
 	u32 mask_save, status, pending;
 
 	mask_save = tm62_read32(dev, TM62_REG_IRQ_MASK);
@@ -1567,10 +1663,42 @@ static irqreturn_t avertm62_irq(int irq, void *dev_id)
 		if (dev->streaming)
 			avertm62_poll_dma_slots(dev);
 		spin_unlock(&dev->qlock);
+
+		if (dev->aud_running &&
+		    (pending & (TM62_IRQ_CH1_VID_DMA | TM62_IRQ_CH1_DMA)))
+			avertm62_aud_poll(dev);
+
+		if (dev->ts_running &&
+		    (pending & (TM62_IRQ_CH0_VID_DMA | TM62_IRQ_CH0_DMA))) {
+			if (pending & TM62_IRQ_CH0_VID_DMA)
+				dev->ts_slot_irqs++;
+			avertm62_ts_poll(dev);
+		}
 	}
 
 	tm62_write32(dev, TM62_REG_IRQ_MASK, mask_save);
 	return IRQ_HANDLED;
+}
+
+static irqreturn_t avertm62_irq(int irq, void *dev_id)
+{
+	struct avertm62_dev *dev = dev_id;
+	irqreturn_t ret;
+
+	struct snd_pcm_substream *ss = NULL;
+
+	spin_lock(&dev->irq_lock);
+	ret = avertm62_irq_locked(dev);
+	if (dev->aud_elapsed) {
+		dev->aud_elapsed = false;
+		ss = dev->aud_ss;
+	}
+	spin_unlock(&dev->irq_lock);
+	/* outside irq_lock: period_elapsed takes the PCM stream lock, and the
+	 * trigger callback takes irq_lock while holding it */
+	if (ss)
+		snd_pcm_period_elapsed(ss);
+	return ret;
 }
 
 static bool avertm62_poll_dma_slots(struct avertm62_dev *dev)
@@ -2112,6 +2240,9 @@ static int avertm62_log_status(struct file *file, void *priv)
 		 locked ? "LOCKED" : "NO SIGNAL", w, h, inter ? "i" : "p",
 		 dev->sii_vid_mode, dev->irq_count, dev->last_irq_pending,
 		 dev->dma_frame_count);
+	dev_info(&dev->pdev->dev, "  TS: running=%d feeds=%d buffers=%u missed=%u\n",
+		 dev->ts_running, dev->ts_feeds, dev->ts_buffers_done,
+		 dev->ts_missed);
 	if (dev->hdmi_chip == HDMI_CHIP_SII9011) {
 		u8 r06 = 0, r08 = 0, r48 = 0, r4a = 0, r45 = 0, r55 = 0, r78 = 0, r3e = 0;
 		u8 r3a = 0, r3b = 0, r3c = 0, r3d = 0;
@@ -2216,7 +2347,7 @@ static ssize_t dbg_pt_show(struct device *d, struct device_attribute *attr, char
 	ssize_t n = 0;
 	int i;
 
-	for (i = 0; i < AVERTM62_HW_BUFS; i++)
+	for (i = 0; i < AVERTM62_ALL_BUFS; i++)
 		n += sysfs_emit_at(buf, n, "%d 0x%05llx %u\n", i,
 				   (unsigned long long)(dev->hw_bufs[i].pt_dma >> 12),
 				   dev->hw_bufs[i].num_pages);
@@ -2240,7 +2371,7 @@ static ssize_t dbg_hwbuf_read(struct file *f, struct kobject *kobj,
 		size_t po = in & (PAGE_SIZE - 1);
 		size_t chunk = min_t(size_t, count - done, PAGE_SIZE - po);
 
-		if (b >= AVERTM62_HW_BUFS || pg >= dev->hw_bufs[b].num_pages)
+		if (b >= AVERTM62_ALL_BUFS || pg >= dev->hw_bufs[b].num_pages)
 			break;
 		memcpy(buf + done, (u8 *)dev->hw_bufs[b].page_cpu[pg] + po, chunk);
 		done += chunk;
@@ -2249,12 +2380,256 @@ static ssize_t dbg_hwbuf_read(struct file *f, struct kobject *kobj,
 }
 static const struct bin_attribute bin_attr_dbg_hwbuf = {
 	.attr = { .name = "dbg_hwbuf", .mode = 0444 },
-	.size = (loff_t)AVERTM62_HW_BUFS * AVERTM62_PT_PAGES * PAGE_SIZE,
+	.size = (loff_t)AVERTM62_ALL_BUFS * AVERTM62_PT_PAGES * PAGE_SIZE,
 	.read_new = dbg_hwbuf_read,
 };
 
+/*
+ * Digital TV transport stream.
+ *
+ * The DRX-K drives a serial TS into the TM6202, which delivers it through DMA
+ * engine 0 (Windows: capture unit 0, stream type 4). Windows sequence:
+ *  - 0x019c[21:20] = 3 (0x4fe64: [20] TS input on, [21] serial, i.e. the
+ *    INF's "TS Stream Type" = 0; the DRX-K is only set to parallel when that
+ *    setting is non-zero, and the H727 INF leaves it unset)
+ *  - engine format 0x0394: [19:18] = 2 (source "DigitalSrc1"), [20] = 1,
+ *    [15:0] = 312 packets, 0x0390 = 0xe520 bytes per descriptor (0x5b69c)
+ *  - 0x0394[22] must also be set, otherwise the engine never takes a
+ *    descriptor (found by testing; the video path sets it for engine 1)
+ *  - channel 0x0300 start: FIFO run, 10 ms, [24] = 0, [31] = 1 (0x65eec)
+ */
+static void avertm62_free_ts_bufs(struct avertm62_dev *dev)
+{
+	int i, p;
+
+	for (i = 0; i < AVERTM62_TS_BUFS; i++) {
+		struct avertm62_ts_buf *tb = &dev->ts_bufs[i];
+
+		for (p = 0; p < AVERTM62_TS_PAGES; p++) {
+			if (tb->page_cpu[p])
+				dma_free_coherent(&dev->pdev->dev, PAGE_SIZE,
+						  tb->page_cpu[p], tb->page_dma[p]);
+			tb->page_cpu[p] = NULL;
+		}
+		if (tb->pt_cpu)
+			dma_free_coherent(&dev->pdev->dev, PAGE_SIZE,
+					  tb->pt_cpu, tb->pt_dma);
+		tb->pt_cpu = NULL;
+	}
+}
+
+static int avertm62_alloc_ts_bufs(struct avertm62_dev *dev)
+{
+	int i, p;
+
+	for (i = 0; i < AVERTM62_TS_BUFS; i++) {
+		struct avertm62_ts_buf *tb = &dev->ts_bufs[i];
+
+		tb->pt_cpu = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE,
+						&tb->pt_dma, GFP_KERNEL);
+		if (!tb->pt_cpu)
+			goto err;
+		for (p = 0; p < AVERTM62_TS_PAGES; p++) {
+			tb->page_cpu[p] = dma_alloc_coherent(&dev->pdev->dev,
+							     PAGE_SIZE,
+							     &tb->page_dma[p],
+							     GFP_KERNEL);
+			if (!tb->page_cpu[p])
+				goto err;
+			tb->pt_cpu[p] = cpu_to_le32((u32)(tb->page_dma[p] &
+							  ~0xfffULL));
+		}
+	}
+	wmb();
+	return 0;
+
+err:
+	avertm62_free_ts_bufs(dev);
+	return -ENOMEM;
+}
+
+static void avertm62_ts_push(struct avertm62_dev *dev, int idx)
+{
+	struct avertm62_ts_buf *tb = &dev->ts_bufs[idx];
+
+	if (tm62_read_bf(dev, TM62_REG_CH0_FIFO_CNT, 0, 4) >= 8)
+		return;
+	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 0, 23, AVERTM62_TS_BYTES);
+	tm62_write32(dev, TM62_REG_CH0_DESC_PTA,
+		     (u32)(tb->pt_dma >> 12) & 0xfffffU);
+	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 31, 1, 1);
+}
+
+static void avertm62_ts_feed_buf(struct avertm62_dev *dev,
+				 struct avertm62_ts_buf *tb, u32 bytes)
+{
+	u32 off = 0;
+	int p = 0;
+
+	for (off = 0; off + 188 <= bytes; off += 188)
+		if (((u8 *)tb->page_cpu[off >> PAGE_SHIFT])[off & ~PAGE_MASK] != 0x47)
+			dev->ts_badsync++;
+	off = 0;
+
+	while (off < bytes && p < AVERTM62_TS_PAGES) {
+		u32 chunk = min_t(u32, PAGE_SIZE, bytes - off);
+
+		dvb_dmx_swfilter(&dev->demux, tb->page_cpu[p], chunk);
+		off += chunk;
+		p++;
+	}
+}
+
+/* Called from the IRQ handler with irq_lock held */
+static void avertm62_ts_poll(struct avertm62_dev *dev)
+{
+	u32 s0 = tm62_read32(dev, TM62_REG_CH0_SLOT0_PTA) & 0xfffffU;
+	int k, slot;
+
+	dev->ts_polls++;
+	if (!s0 || s0 == dev->ts_last_pta)
+		return;
+
+	/* Completion slots form a 5-deep history, newest in slot 0 */
+	for (k = 0; k < 5; k++) {
+		u32 pta = tm62_read32(dev, TM62_REG_CH0_SLOT0_PTA + 4 * k) &
+			  0xfffffU;
+
+		if (!pta || pta == dev->ts_last_pta)
+			break;
+	}
+	if (k == 5 && dev->ts_last_pta)
+		dev->ts_missed++;
+	dev->ts_last_pta = s0;
+
+	for (slot = k - 1; slot >= 0; slot--) {
+		u32 sts = tm62_read32(dev, TM62_REG_CH0_SLOT0_STS + 4 * slot);
+		u32 pta = tm62_read32(dev, TM62_REG_CH0_SLOT0_PTA + 4 * slot) &
+			  0xfffffU;
+		u32 bytes = min_t(u32, sts & 0x3fffffU, AVERTM62_TS_BYTES);
+		int b;
+
+		if (bytes < AVERTM62_TS_BYTES)
+			dev->ts_short++;
+
+		for (b = 0; b < AVERTM62_TS_BUFS; b++)
+			if (((u32)(dev->ts_bufs[b].pt_dma >> 12) & 0xfffffU) == pta)
+				break;
+		if (b >= AVERTM62_TS_BUFS)
+			continue;
+
+		avertm62_ts_feed_buf(dev, &dev->ts_bufs[b], bytes);
+		dev->ts_buffers_done++;
+		avertm62_ts_push(dev, b);
+	}
+}
+
+static void avertm62_ts_hw_start(struct avertm62_dev *dev)
+{
+	unsigned long flags;
+	int i;
+
+	tm62_write_bf(dev, TM62_REG_DMA_GLB_CFG, 9, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_MISC, 23, 1, 1);
+	/* [20] TS input on, [21] serial (Windows: "TS Stream Type" == 0) */
+	tm62_write_bf(dev, TM62_REG_STREAM_ROUTE, 20, 1, 1);
+	tm62_write_bf(dev, TM62_REG_STREAM_ROUTE, 21, 1, drxk_parallel ? 0 : 1);
+
+	/* Stop and flush engine 0 */
+	tm62_write32(dev, TM62_REG_CH0_DMA_CFG, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 1);
+	udelay(10);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 0);
+
+	tm62_write32(dev, TM62_REG_CH0_FRAME_BYTES, AVERTM62_TS_BYTES);
+	tm62_write32(dev, TM62_REG_CH0_FMT_CFG,
+		     BIT(30) | BIT(22) | BIT(20) | (2U << 18) | (2U << 16) |
+		     AVERTM62_TS_PKTS);
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	dev->ts_last_pta = 0;
+	dev->ts_buffers_done = dev->ts_missed = dev->ts_short = 0;
+	dev->ts_badsync = dev->ts_polls = dev->ts_slot_irqs = 0;
+	dev->ts_running = true;
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+
+	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 1);
+	msleep(10);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_CFG, 24, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_CFG, 31, 1, 1);
+	for (i = 0; i < AVERTM62_TS_BUFS; i++)
+		avertm62_ts_push(dev, i);
+
+	/* Engine 0 timer as a 100 Hz backup poll in case a slot IRQ is missed */
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_TIMER, 0, 30, 0x07698000U / 100);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_TIMER, 30, 1, 1);
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	tm62_write32(dev, TM62_REG_IRQ_ACK, TM62_IRQ_CH0_VID_DMA | TM62_IRQ_CH0_DMA);
+	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 0, 1, 0);
+	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 16, 1, 0);
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+}
+
+static void avertm62_ts_hw_stop(struct avertm62_dev *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	if (!dev->ts_running) {
+		spin_unlock_irqrestore(&dev->irq_lock, flags);
+		return;
+	}
+	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 0, 1, 1);
+	tm62_write_bf(dev, TM62_REG_IRQ_MASK, 16, 1, 1);
+	dev->ts_running = false;
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+	dev_info(&dev->pdev->dev,
+		 "TS stopped: buffers=%u missed=%u short=%u badsync=%u polls=%u slot_irqs=%u\n",
+		 dev->ts_buffers_done, dev->ts_missed, dev->ts_short,
+		 dev->ts_badsync, dev->ts_polls, dev->ts_slot_irqs);
+
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_TIMER, 30, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_CFG, 31, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_DESC_CTRL, 30, 1, 0);
+	tm62_write_bf(dev, TM62_REG_CH0_FMT_CFG, 31, 1, 1);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 1);
+	udelay(10);
+	tm62_write_bf(dev, TM62_REG_CH0_DMA_START, 0, 1, 0);
+}
+
+static int avertm62_ts_start_feed(struct dvb_demux_feed *feed)
+{
+	struct avertm62_dev *dev = feed->demux->priv;
+
+	mutex_lock(&dev->ts_mutex);
+	if (dev->ts_feeds++ == 0)
+		avertm62_ts_hw_start(dev);
+	mutex_unlock(&dev->ts_mutex);
+	return 0;
+}
+
+static int avertm62_ts_stop_feed(struct dvb_demux_feed *feed)
+{
+	struct avertm62_dev *dev = feed->demux->priv;
+
+	mutex_lock(&dev->ts_mutex);
+	if (dev->ts_feeds > 0 && --dev->ts_feeds == 0)
+		avertm62_ts_hw_stop(dev);
+	mutex_unlock(&dev->ts_mutex);
+	return 0;
+}
+
 static void avertm62_dvb_exit(struct avertm62_dev *dev)
 {
+	avertm62_ts_hw_stop(dev);
+	if (dev->dvb_dmxdev_registered)
+		dvb_dmxdev_release(&dev->dmxdev);
+	if (dev->dvb_demux_registered)
+		dvb_dmx_release(&dev->demux);
+	dev->dvb_dmxdev_registered = false;
+	dev->dvb_demux_registered = false;
 	if (dev->dvb_fe_registered)
 		dvb_unregister_frontend(dev->fe);
 	if (dev->fe)
@@ -2264,6 +2639,7 @@ static void avertm62_dvb_exit(struct avertm62_dev *dev)
 	dev->fe = NULL;
 	dev->dvb_fe_registered = false;
 	dev->dvb_adap_registered = false;
+	avertm62_free_ts_bufs(dev);
 }
 
 static int avertm62_dvb_init(struct avertm62_dev *dev)
@@ -2274,6 +2650,21 @@ static int avertm62_dvb_init(struct avertm62_dev *dev)
 		.chunk_size = 56,
 		.microcode_name = drxk_fw,
 		.parallel_ts = !!drxk_parallel,
+		/*
+		 * Static-clock mode in the kernel driver assumes 50 Mbit/s and
+		 * clocks the serial TS at 151.875 MHz / 3 = 50.6 MHz, which the
+		 * TM6202 can't follow (about a third of the packets are lost).
+		 * Dynamic mode uses DTO period 2 (38 MHz), the same rate the
+		 * Windows driver programs (35.2 Mbit/s default, 0x217f0).
+		 */
+		.dynamic_clk = !static_ts_clk,
+		/*
+		 * Windows drives MSTRT, MERR, MVAL, MCLK and MD0-7 (drive 2, 0x13,
+		 * 0x219b8). The kernel leaves MERR/MVAL off unless asked, and the
+		 * TM6202 needs MVAL to know which clocks carry data.
+		 */
+		.enable_merr_cfg = true,
+		.mpeg_out_clk_strength = 2,
 	};
 	static struct tda18271_config tda_cfg = {
 		.gate = TDA18271_GATE_AUTO,
@@ -2309,7 +2700,33 @@ static int avertm62_dvb_init(struct avertm62_dev *dev)
 	if (ret < 0)
 		goto err;
 	dev->dvb_fe_registered = true;
-	dev_info(&dev->pdev->dev, "DVB frontend registered (DRX-K + TDA18271)\n");
+
+	ret = avertm62_alloc_ts_bufs(dev);
+	if (ret < 0)
+		goto err;
+
+	dev->demux.dmx.capabilities = DMX_TS_FILTERING | DMX_SECTION_FILTERING |
+				      DMX_MEMORY_BASED_FILTERING;
+	dev->demux.priv = dev;
+	dev->demux.filternum = 256;
+	dev->demux.feednum = 256;
+	dev->demux.start_feed = avertm62_ts_start_feed;
+	dev->demux.stop_feed = avertm62_ts_stop_feed;
+	ret = dvb_dmx_init(&dev->demux);
+	if (ret < 0)
+		goto err;
+	dev->dvb_demux_registered = true;
+
+	dev->dmxdev.filternum = 256;
+	dev->dmxdev.demux = &dev->demux.dmx;
+	dev->dmxdev.capabilities = 0;
+	ret = dvb_dmxdev_init(&dev->dmxdev, &dev->dvb_adap);
+	if (ret < 0)
+		goto err;
+	dev->dvb_dmxdev_registered = true;
+
+	dev_info(&dev->pdev->dev,
+		 "DVB registered: DRX-K + TDA18271, serial TS on DMA engine 0\n");
 	return 0;
 
 err:
@@ -2342,6 +2759,300 @@ static void avertm62_probe_i2c_and_hdmi(struct avertm62_dev *dev)
 		dev_warn(&dev->pdev->dev, "No HDMI receiver responded on I2C0\n");
 }
 
+/* ------------------------------------------------------------------------ */
+/* ALSA capture: HDMI audio from the SiI9011 I2S output                     */
+/*
+ * Engine 1 has an audio DMA channel (Windows stream type 3, channel object
+ * at engine object + 8): channel 0x0460, descriptor FIFO 0x0660/0x0664,
+ * completion history 0x0464.. (status) / 0x0478.. (page table address),
+ * newest in slot 0, like the video and TS channels. Its source is
+ * 0x0494[17:16]; 1 is the SiI9011's I2S output. The channel only advances
+ * while engine 1 is running, i.e. while HDMI video is streaming, and closes
+ * one descriptor per video frame with however many samples arrived.
+ */
+static void avertm62_free_aud_bufs(struct avertm62_dev *dev)
+{
+	int i, p;
+
+	for (i = 0; i < AVERTM62_AUD_BUFS; i++) {
+		struct avertm62_ts_buf *ab = &dev->aud_bufs[i];
+
+		for (p = 0; p < AVERTM62_TS_PAGES; p++) {
+			if (ab->page_cpu[p])
+				dma_free_coherent(&dev->pdev->dev, PAGE_SIZE,
+						  ab->page_cpu[p], ab->page_dma[p]);
+			ab->page_cpu[p] = NULL;
+		}
+		if (ab->pt_cpu)
+			dma_free_coherent(&dev->pdev->dev, PAGE_SIZE,
+					  ab->pt_cpu, ab->pt_dma);
+		ab->pt_cpu = NULL;
+	}
+}
+
+static int avertm62_alloc_aud_bufs(struct avertm62_dev *dev)
+{
+	int i, p;
+
+	for (i = 0; i < AVERTM62_AUD_BUFS; i++) {
+		struct avertm62_ts_buf *ab = &dev->aud_bufs[i];
+
+		ab->pt_cpu = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE,
+						&ab->pt_dma, GFP_KERNEL);
+		if (!ab->pt_cpu)
+			goto err;
+		for (p = 0; p < AVERTM62_TS_PAGES; p++) {
+			ab->page_cpu[p] = dma_alloc_coherent(&dev->pdev->dev,
+							     PAGE_SIZE,
+							     &ab->page_dma[p],
+							     GFP_KERNEL);
+			if (!ab->page_cpu[p])
+				goto err;
+			ab->pt_cpu[p] = cpu_to_le32((u32)(ab->page_dma[p] &
+							  ~0xfffULL));
+		}
+	}
+	wmb();
+	return 0;
+err:
+	avertm62_free_aud_bufs(dev);
+	return -ENOMEM;
+}
+
+static void avertm62_aud_push(struct avertm62_dev *dev, int idx)
+{
+	struct avertm62_ts_buf *ab = &dev->aud_bufs[idx];
+
+	if (tm62_read_bf(dev, TM62_REG_AUD1_FIFO_CNT, 0, 4) >= 8)
+		return;
+	tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 0, 23, AVERTM62_AUD_BYTES);
+	tm62_write32(dev, TM62_REG_AUD1_DESC_PTA,
+		     (u32)(ab->pt_dma >> 12) & 0xfffffU);
+	tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 31, 1, 1);
+}
+
+/* Copy one completed DMA buffer into the ALSA ring buffer */
+static void avertm62_aud_copy(struct avertm62_dev *dev,
+			      struct avertm62_ts_buf *ab, u32 bytes)
+{
+	struct snd_pcm_runtime *rt = dev->aud_ss->runtime;
+	u32 size = frames_to_bytes(rt, rt->buffer_size);
+	u32 period = frames_to_bytes(rt, rt->period_size);
+	u32 off = 0;
+
+	bytes &= ~3U;			/* whole stereo frames */
+	while (off < bytes) {
+		u32 in_page = PAGE_SIZE - (off & ~PAGE_MASK);
+		u32 room = size - dev->aud_pos;
+		u32 n = min3(bytes - off, in_page, room);
+
+		memcpy(rt->dma_area + dev->aud_pos,
+		       (u8 *)ab->page_cpu[off >> PAGE_SHIFT] + (off & ~PAGE_MASK), n);
+		off += n;
+		dev->aud_pos += n;
+		if (dev->aud_pos >= size)
+			dev->aud_pos = 0;
+	}
+	dev->aud_period_acc += bytes;
+	if (dev->aud_period_acc >= period) {
+		dev->aud_period_acc %= period;
+		dev->aud_elapsed = true;
+	}
+}
+
+/* Called from the IRQ handler with irq_lock held */
+static void avertm62_aud_poll(struct avertm62_dev *dev)
+{
+	u32 s0 = tm62_read32(dev, TM62_REG_AUD1_SLOT0_PTA) & 0xfffffU;
+	int k, slot;
+
+	if (!dev->aud_ss || !s0 || s0 == dev->aud_last_pta)
+		return;
+	for (k = 0; k < 5; k++) {
+		u32 pta = tm62_read32(dev, TM62_REG_AUD1_SLOT0_PTA + 4 * k) &
+			  0xfffffU;
+
+		if (!pta || pta == dev->aud_last_pta)
+			break;
+	}
+	dev->aud_last_pta = s0;
+
+	for (slot = k - 1; slot >= 0; slot--) {
+		u32 sts = tm62_read32(dev, TM62_REG_AUD1_SLOT0_STS + 4 * slot);
+		u32 pta = tm62_read32(dev, TM62_REG_AUD1_SLOT0_PTA + 4 * slot) &
+			  0xfffffU;
+		u32 bytes = min_t(u32, sts & 0x3fffffU, AVERTM62_AUD_BYTES);
+		int b;
+
+		for (b = 0; b < AVERTM62_AUD_BUFS; b++)
+			if (((u32)(dev->aud_bufs[b].pt_dma >> 12) & 0xfffffU) == pta)
+				break;
+		if (b >= AVERTM62_AUD_BUFS)
+			continue;
+		if (bytes)
+			avertm62_aud_copy(dev, &dev->aud_bufs[b], bytes);
+		dev->aud_frames_done++;
+		avertm62_aud_push(dev, b);
+	}
+}
+
+static const struct snd_pcm_hardware avertm62_pcm_hw = {
+	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates = SNDRV_PCM_RATE_48000,
+	.rate_min = 48000,
+	.rate_max = 48000,
+	.channels_min = 2,
+	.channels_max = 2,
+	.buffer_bytes_max = 256 * 1024,
+	.period_bytes_min = 1024,
+	.period_bytes_max = 64 * 1024,
+	.periods_min = 2,
+	.periods_max = 64,
+};
+
+static int avertm62_pcm_open(struct snd_pcm_substream *ss)
+{
+	struct avertm62_dev *dev = snd_pcm_substream_chip(ss);
+
+	ss->runtime->hw = avertm62_pcm_hw;
+	dev->aud_ss = ss;
+	return 0;
+}
+
+static int avertm62_pcm_close(struct snd_pcm_substream *ss)
+{
+	struct avertm62_dev *dev = snd_pcm_substream_chip(ss);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	dev->aud_ss = NULL;
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+	return 0;
+}
+
+/* Sleepable: stop and flush the channel, start its FIFO (Windows 0x65eec) */
+static int avertm62_pcm_prepare(struct snd_pcm_substream *ss)
+{
+	struct avertm62_dev *dev = snd_pcm_substream_chip(ss);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	dev->aud_running = false;
+	dev->aud_pos = dev->aud_period_acc = 0;
+	dev->aud_last_pta = 0;
+	dev->aud_elapsed = false;
+	tm62_write32(dev, TM62_REG_AUD1_DMA_CFG, 0);
+	tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 30, 1, 0);
+	tm62_write_bf(dev, TM62_REG_AUD1_FIFO_RST, 0, 1, 1);
+	udelay(10);
+	tm62_write_bf(dev, TM62_REG_AUD1_FIFO_RST, 0, 1, 0);
+	tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 30, 1, 1);
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+	msleep(10);
+	return 0;
+}
+
+static int avertm62_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
+{
+	struct avertm62_dev *dev = snd_pcm_substream_chip(ss);
+	unsigned long flags;
+	int i;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+		spin_lock_irqsave(&dev->irq_lock, flags);
+		tm62_write_bf(dev, TM62_REG_CH1_FMT_CFG, 16, 2, AVERTM62_AUD_SRC_HDMI);
+		tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 24, 1, 0);
+		tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 31, 1, 1);
+		for (i = 0; i < AVERTM62_AUD_BUFS; i++)
+			avertm62_aud_push(dev, i);
+		dev->aud_running = true;
+		spin_unlock_irqrestore(&dev->irq_lock, flags);
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+		spin_lock_irqsave(&dev->irq_lock, flags);
+		dev->aud_running = false;
+		tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 31, 1, 0);
+		tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 30, 1, 0);
+		spin_unlock_irqrestore(&dev->irq_lock, flags);
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static snd_pcm_uframes_t avertm62_pcm_pointer(struct snd_pcm_substream *ss)
+{
+	struct avertm62_dev *dev = snd_pcm_substream_chip(ss);
+
+	return bytes_to_frames(ss->runtime, READ_ONCE(dev->aud_pos));
+}
+
+static const struct snd_pcm_ops avertm62_pcm_ops = {
+	.open = avertm62_pcm_open,
+	.close = avertm62_pcm_close,
+	.prepare = avertm62_pcm_prepare,
+	.trigger = avertm62_pcm_trigger,
+	.pointer = avertm62_pcm_pointer,
+};
+
+static int avertm62_alsa_init(struct avertm62_dev *dev)
+{
+	struct snd_card *card;
+	struct snd_pcm *pcm;
+	int ret;
+
+	ret = avertm62_alloc_aud_bufs(dev);
+	if (ret)
+		return ret;
+	ret = snd_card_new(&dev->pdev->dev, -1, "H727", THIS_MODULE, 0, &card);
+	if (ret)
+		goto err_bufs;
+	strscpy(card->driver, "avertm62", sizeof(card->driver));
+	strscpy(card->shortname, "AVerMedia H727", sizeof(card->shortname));
+	snprintf(card->longname, sizeof(card->longname),
+		 "AVerMedia H727 HDMI audio at %s", pci_name(dev->pdev));
+
+	ret = snd_pcm_new(card, "H727 HDMI", 0, 0, 1, &pcm);
+	if (ret)
+		goto err_card;
+	pcm->private_data = dev;
+	strscpy(pcm->name, "H727 HDMI", sizeof(pcm->name));
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &avertm62_pcm_ops);
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
+
+	ret = snd_card_register(card);
+	if (ret)
+		goto err_card;
+	dev->snd_card = card;
+	dev_info(&dev->pdev->dev, "ALSA capture card %d: HDMI audio (needs HDMI video streaming)\n",
+		 card->number);
+	return 0;
+
+err_card:
+	snd_card_free(card);
+err_bufs:
+	avertm62_free_aud_bufs(dev);
+	return ret;
+}
+
+static void avertm62_alsa_exit(struct avertm62_dev *dev)
+{
+	unsigned long flags;
+
+	if (!dev->snd_card)
+		return;
+	spin_lock_irqsave(&dev->irq_lock, flags);
+	dev->aud_running = false;
+	tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 31, 1, 0);
+	tm62_write_bf(dev, TM62_REG_AUD1_DESC_CTRL, 30, 1, 0);
+	spin_unlock_irqrestore(&dev->irq_lock, flags);
+	snd_card_free(dev->snd_card);
+	dev->snd_card = NULL;
+	avertm62_free_aud_bufs(dev);
+}
+
 static int avertm62_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *ent)
 {
@@ -2358,6 +3069,8 @@ static int avertm62_pci_probe(struct pci_dev *pdev,
 	mutex_init(&dev->lock);
 	mutex_init(&dev->i2c_lock);
 	spin_lock_init(&dev->qlock);
+	spin_lock_init(&dev->irq_lock);
+	mutex_init(&dev->ts_mutex);
 	INIT_LIST_HEAD(&dev->buf_list);
 	timer_setup(&dev->fallback_timer, avertm62_fallback_timer_fn, 0);
 
@@ -2478,6 +3191,8 @@ static int avertm62_pci_probe(struct pci_dev *pdev,
 
 	if (dvb && avertm62_dvb_init(dev) < 0)
 		dev_warn(&pdev->dev, "DVB frontend not available; analog capture still works\n");
+	if (audio && avertm62_alsa_init(dev) < 0)
+		dev_warn(&pdev->dev, "ALSA audio capture not available\n");
 	return 0;
 
 err_unreg_v4l2:
@@ -2511,6 +3226,7 @@ static void avertm62_pci_remove(struct pci_dev *pdev)
 		device_remove_bin_file(&pdev->dev, &bin_attr_dbg_hwbuf);
 		device_remove_file(&pdev->dev, &dev_attr_dbg_pt);
 	}
+	avertm62_alsa_exit(dev);
 	avertm62_dvb_exit(dev);
 	video_unregister_device(&dev->vdev);
 	v4l2_device_unregister(&dev->v4l2_dev);

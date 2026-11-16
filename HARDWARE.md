@@ -23,9 +23,9 @@ live I2C scan through the driver's adapters. I2C addresses are 8-bit.
 |---|---|---|
 | HDMI | SiI9011 → TM6202 port 1 (0x0180 block) → DMA engine 1 | **Working**: 1080i60 at 30 fps |
 | Component YPbPr | AD9985A → TM6202 | Not implemented |
-| Composite (yellow) / S-Video | TM6202 internal decoder (AnalogSrc1 inputs 1 / 2) | Not implemented |
+| Composite (yellow) / S-Video | TM6202 internal decoder (AnalogSrc1 inputs 1 / 2) | **Working** (composite): PAL 720x576 colour, 25 fps |
 | RF antenna, analog | TDA18271 → TM6202 internal decoder (AnalogSrc1 input 0) | Not implemented |
-| RF antenna, digital | TDA18271 → DRX-K → TM6202 MPEG-TS DMA | Not implemented |
+| RF antenna, digital | TDA18271 → DRX-K → serial TS → TM6202 DMA engine 0 | **Working**: DVB frontend, demux0, dvr0 |
 
 ## Composite path (TM6202 internal decoder), findings so far
 
@@ -177,7 +177,43 @@ The AD9985A is the **component** front end: its 17-register mode table
   `drxk_config.no_i2c_bridge = true`.
 - With the driver's `dvb=1`, Melbourne Ten 219.5 MHz and ABC 226.5 MHz lock
   fully in 0.7 s; Seven/SBS partial, Nine nothing (antenna/frequency list).
-- TS DMA route NOT found yet. Probed (with ABC locked, serial and parallel TS):
+### Transport stream (solved 2026-11-16)
+
+The DRX-K drives a **serial** TS (with MVAL) into the TM6202, which delivers
+it through **DMA engine 0**. Driver: `avertm62_ts_hw_start()`.
+
+| Setting | Value | Source |
+|---|---|---|
+| DRX-K output | serial, MSTRT/MERR/MVAL/MCLK/MD0 enabled (kernel `enable_merr_cfg = true`) | Windows 0x219b8 drives every TS pin at 0x13. Without MVAL the TM6202 only takes ~13.5 Mbit/s |
+| DRX-K clock | dynamic (kernel), or static at DTO period 2 (Windows: 32 Mbit/s, 0x217f0) | kernel static mode (50 Mbit/s, 50.6 MHz) also works |
+| `0x019c[20]` | 1, TS input on | Windows 0x4fe64 |
+| `0x019c[21]` | 1 = serial (INF "TS Stream Type" = 0, the default) | Windows 0x4fe64. The DRX-K is only set to parallel when that setting is non-zero (0x1cc79) |
+| `0x0394` | `0x405a0138`: [15:0]=312 packets, [17:16]=2, [19:18]=2 (source "DigitalSrc1"), [20]=1, [22]=1, [30]=1 | Windows 0x5b69c writes [15:0], [19:18], [20]. **[22] is required**: without it engine 0 never takes a descriptor |
+| `0x0390` | 0xe520 (312 x 188 bytes per descriptor) | Windows 0x5b69c |
+| channel `0x0300` | stride 0, FIFO run, 10 ms, [24]=0, [31]=1 | Windows 0x65eec |
+| IRQ | bit 0 (engine 0 slot done) fires once per descriptor | Windows enables IRQ 0x14 |
+
+Windows' object model: the BDA TS filter (0x47700) sets source 2 or 3 from its
+GUID ("DigitalSrc1"/"DigitalSrc2"); the pin (vtable 0x1025a0, type 4) opens a
+capture unit (0x5c184). Sources 0/2/3 use unit 0 = engine 0 and source 1 uses
+unit 1 = engine 1 (0x60e40). "DTV Source Type" (INF = 1) selects the DVB-T
+demodulator object (0 ATSC, 1 DVB-T, 2 DVB-S, 3 DVB-C; 0x51448).
+
+Things that turned out NOT to matter: `0x0160[7]`, `0x03a8`, the engine-0 timer
+(`0x03a0`), `0x0190` bits, the TM6010-style digital-mode registers.
+
+Results (Melbourne, antenna as installed): Ten 219.5 MHz runs at the full
+23.05 Mbit/s (PCR-verified), no transport errors. ABC 226.5 MHz runs at full
+rate but ~25% of packets carry the DRX-K's transport-error flag (reception).
+Seven / SBS / Nine don't lock with this antenna. A DRX-K quirk: Ten's output
+starts ~4 s after lock, ABC's immediately.
+
+Tools: `tools/dvbt_record.py` (record / analyse a multiplex),
+`tools/dvbt_scan.py` (channel list to `~/.config/h727/channels.json`).
+
+### Earlier dead ends (kept for reference)
+
+- Before the fix (MVAL off, engine 0 without [22]), probed with ABC locked:
   - `0x0160[7]=1` opens the capture gate Windows uses for this path
     (0x51f84); without it no channel receives any data.
   - Channel `0x330` (engine 0, second channel) = raw VBI samples from the
@@ -218,7 +254,44 @@ The AD9985A is the **component** front end: its 17-register mode table
 - AnalogSrc1 audio: tuner = 2, composite = 0, S-Video = 0 (TAD internal decoder).
 - AnalogSrc2 audio (HDMI/component side): WM8739 at 0x34 through the AD1871
   I2S mux. GPIO6 = I2S switch, GPIO2 = tuner audio, GPIO1 = composite audio.
-- No ALSA capture device is implemented yet.
+### HDMI audio (solved 2026-11-16)
+
+The driver registers an ALSA capture card `H727` (`hw:H727`, 48 kHz stereo
+S16_LE). Recipe:
+
+| Setting | Value | Notes |
+|---|---|---|
+| DMA channel | engine 1 audio channel `0x0460`, FIFO `0x0660`/`0x0664`, FIFO reset `0x066c[0]` | Windows stream type 3, channel object = engine object + 8 |
+| Completion history | status `0x0464`.., PTA `0x0478`.., newest in slot 0 | same layout as the video/TS channels |
+| Source | `0x0494[17:16]` = 1 | 0 = other I2S input (idle ADC, DC offset), 1 = SiI9011 I2S, 2 = none (video default), 3 = silence |
+| Start | FIFO run `[30]`, 10 ms, channel `[24]`=0, `[31]`=1, push descriptors | generic channel start (Windows 0x65eec) |
+| Timing | one descriptor closes per video frame (6400 bytes at 30 fps) | only while engine 1 runs, i.e. HDMI video must be streaming |
+
+- The SiI9011 audio page needs nothing beyond the driver's init values; its
+  outputs must be on (`0x68:0x3e = 0xd7`, done by HDMI video start).
+- Proof it is the programme: left/right correlation 0.9, and the samples
+  stop when the SiI9011 outputs are powered down.
+- The level is low (about -45 dBFS RMS on the test source) but sounds right
+  when played (user check), so it is the source level, not misalignment.
+  SiI `0x68:0x26` bit 1 turns the samples into full-scale noise and bit 2
+  into sign bits only, so the bit clock and data are genuinely arriving.
+
+Pitfalls found on the way:
+
+- Any write to the GPIO block (`0x0750`-`0x075c`), even rewriting a register
+  with its current value, resets the SiI9011; it is reconfigured when HDMI
+  video starts.
+- The SiI9011's registers reset when the driver reloads and only come back
+  when HDMI video starts.
+- Engine 0's audio channel `0x0360` also runs (internally clocked, ~48 kHz)
+  but carries only zeros on this board.
+- `0x0280` is the internal audio block: `[3]` digital source select,
+  `[7:4]` sample clock, `[8]` = 0 stops engine 0's audio channel,
+  `[20:16]`/`[28:24]` volume, `[21]`/`[29]` mute. `0x0200`-`0x022c` is the
+  TAD TV-sound decoder. `0x0700`-`0x071c` are the I2C controllers, `0x0730`
+  -`0x0744` the IR receiver.
+- `debug_sysfs=1` fills the debug DMA buffers with 0xaa and adds a ninth
+  buffer that no stream uses, for experiments.
 
 ## GPIOs
 
