@@ -11,7 +11,7 @@ the hardware live.
 | HDMI audio | Working: ALSA card `H727` (48 kHz stereo) |
 | Composite video (PAL) | Working: V4L2 input 1, colour, 25 fps |
 | Digital TV (DVB-T) | Working: `/dev/dvb/adapterN` (frontend, demux, dvr) |
-| Composite / analog audio | Not yet |
+| Analog audio (breakout L/R jacks) | Working: same ALSA card, with composite |
 | Component (YPbPr), S-Video | Not tested |
 
 It was developed against a card in Melbourne, Australia (PAL, DVB-T 7 MHz).
@@ -47,7 +47,8 @@ Module parameters (all optional):
 | Parameter | Default | Meaning |
 |---|---|---|
 | `dvb` | 1 | Register the DVB-T tuner, demux and dvr devices |
-| `audio` | 1 | Register the ALSA capture card for HDMI audio |
+| `audio` | 1 | Register the ALSA capture card (HDMI and L/R line audio) |
+| `analog_gain` | 31 | WM8739 line input gain for the L/R jacks (0x17 = 0 dB, 1.5 dB steps) |
 | `drxk_parallel` | 0 | Parallel instead of serial TS from the demodulator |
 | `static_ts_clk` | 0 | Fixed instead of dynamic TS clock |
 | `debug_sysfs` | 0 | Expose DMA buffers in sysfs for experiments |
@@ -69,7 +70,7 @@ python3 viewer/h727view.py                 # starts on the current V4L2 input
 python3 viewer/h727view.py --tv "ABC TV"   # starts on a TV channel
 ```
 
-HDMI and TV play with sound. Any V4L2/DVB/ALSA application should also work,
+HDMI, composite (with the L/R jacks) and TV play with sound. Any V4L2/DVB/ALSA application should also work,
 for example:
 
 ```bash
@@ -93,7 +94,10 @@ multiplex frequencies (and `--bw 8` outside Australia) to use it elsewhere.
   clocked by the video DMA engine). The viewer always streams video, so this
   only matters for audio-only use.
 - HDMI audio is captured at 48 kHz only.
-- No audio yet for composite or the analog line inputs.
+- Composite audio must go into the breakout's separate L/R jacks; the red/white
+  plugs in the yellow composite bundle are not wired to anything found. The
+  L/R input is quiet even at maximum gain, so the viewer boosts it.
+- Audio only flows while video streams (HDMI or composite).
 - Any write to the TM6202 GPIO registers resets the HDMI receiver; the driver
   reconfigures it when HDMI video starts.
 

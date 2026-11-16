@@ -293,6 +293,35 @@ Pitfalls found on the way:
 - `debug_sysfs=1` fills the debug DMA buffers with 0xaa and adds a ninth
   buffer that no stream uses, for experiments.
 
+### Analog audio: the L/R jacks (solved 2026-11-16)
+
+The breakout's separate **L/R audio jacks** (not the red/white plugs in the
+yellow composite bundle) go to the Wolfson WM8739 ADC, whose I2S output
+reaches the TM6202 on audio source 1, the same input as the SiI9011's HDMI
+audio. The driver selects it for the composite input:
+
+| Step | Setting |
+|---|---|
+| Audio switch | GPIO1 = 0, GPIO2 = 1, both outputs (Windows' "composite" state of the AD1871 class). GPIO1 = 1 stops the WM8739's clocks reaching the TM6202 |
+| WM8739 (I2C bus 0, 0x34, write-only: byte 1 = reg << 1 \| D8) | R15 = 0 reset, R9 = 0, R0/R1 = line gain, R5 = 0, R6 = 0x5a power (bit 0 = line in, bit 5 = oscillator), R7 = 0x42 I2S master 16-bit, R8 = 0 (48 kHz), R9 = 1 active |
+| Source | `0x0494[17:16]` = 1 |
+| Back to HDMI | WM8739 R6 = 0xff, R9 = 0; GPIO1/2 back to inputs; reconfigure the SiI9011 (GPIO writes reset it) |
+
+- The input arrives about 40 dB quieter than line level: at Windows' gain
+  (R0/R1 = 0x18, +1.5 dB) music peaked near -42 dBFS. The driver uses the
+  maximum (+12 dB, module parameter `analog_gain`) and the viewer adds
+  +20 dB in software. The level follows R0/R1 and R0/R1 = 0x80 mutes it,
+  so this is the real input; why it is so low is not known.
+- The red/white plugs in the yellow composite bundle are not wired to any
+  converter found; with the music on them, the TM6202's own ADC (source 0)
+  picked up only hum.
+- Windows maps its audio-input modes to `[17:16]` at 0x54fca: modes 0/1 ->
+  0, mode 2 (external decoder) -> 1, mode 3 (line ADC) -> 2, other -> 3;
+  muting writes 3 and unmuting restores the stored value (0x54dd0).
+- Source 2 never produced data, even with Windows' line-ADC settings
+  (`0x0290`-`0x029c`); the AD1871 never appeared on the I2S input.
+- The driver's `audio_src` parameter (0-3) forces the source for testing.
+
 ## GPIOs
 
 | GPIO | Function |

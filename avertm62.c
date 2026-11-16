@@ -100,6 +100,14 @@ static int audio = 1;
 module_param(audio, int, 0444);
 MODULE_PARM_DESC(audio, "Register the ALSA capture device for HDMI audio: 1 = on (default), 0 = off");
 
+static int analog_gain = 0x1f;
+module_param(analog_gain, int, 0644);
+MODULE_PARM_DESC(analog_gain, "WM8739 line input gain for the L/R jacks: 0-31 (0x17 = 0 dB, 1.5 dB steps, default 31 = +12 dB)");
+
+static int audio_src = -1;
+module_param(audio_src, int, 0644);
+MODULE_PARM_DESC(audio_src, "Engine-1 audio source 0x0494[17:16]: -1 = follow the input (default), 0-3 = force");
+
 static char *drxk_fw;
 module_param(drxk_fw, charp, 0444);
 MODULE_PARM_DESC(drxk_fw, "DRX-K microcode file to load (default: none, use the chip's ROM code)");
@@ -272,6 +280,9 @@ MODULE_PARM_DESC(debug_sysfs, "Expose dbg_pt / dbg_hwbuf sysfs files for DMA exp
 /* 0x0494[17:16]: audio source of engine 1's audio channel (found by testing):
  * 0/1 = the two I2S inputs (1 = SiI9011 HDMI audio), 2 = none, 3 = silence */
 #define AVERTM62_AUD_SRC_HDMI		1
+/* Analog audio (the breakout's L/R jacks) comes from the WM8739 over the
+ * same I2S input as HDMI; GPIO1/GPIO2 switch the I2S bus between them */
+#define AVERTM62_AUD_SRC_ANALOG		1
 
 enum avertm62_hdmi_chip {
 	HDMI_CHIP_NONE = 0,
@@ -374,6 +385,7 @@ struct avertm62_dev {
 	struct snd_pcm_substream *aud_ss;
 	struct avertm62_ts_buf	aud_bufs[AVERTM62_AUD_BUFS];
 	bool			aud_running;
+	bool			analog_audio;	/* GPIO1/2 + WM8739 set up for the L/R jacks */
 	bool			aud_elapsed;	/* call period_elapsed after the IRQ */
 	u32			aud_last_pta;
 	u32			aud_pos;	/* write position in the ALSA buffer, bytes */
@@ -1323,6 +1335,63 @@ static void avertm62_dma_fifo_reset(struct avertm62_dev *dev)
 	tm62_write_bf(dev, TM62_REG_DMA_START, 0, 1, 0);
 }
 
+static u32 avertm62_aud_src(struct avertm62_dev *dev)
+{
+	if (audio_src >= 0 && audio_src <= 3)
+		return audio_src;
+	return dev->input == AVERTM62_INPUT_HDMI ? AVERTM62_AUD_SRC_HDMI
+						 : AVERTM62_AUD_SRC_ANALOG;
+}
+
+/*
+ * Analog audio: the breakout's L/R jacks go to a Wolfson WM8739 ADC (I2C bus
+ * 0, 0x34; write-only, 7-bit register + 9-bit data). The INF's AD1871 "I2S
+ * mux" class drives GPIO1/GPIO2; Windows' composite setting (GPIO1 = 0,
+ * GPIO2 = 1) is the only one in which the WM8739's I2S reaches the TM6202,
+ * where it lands on audio source 1 like the SiI9011's HDMI audio. Any write
+ * to the GPIO block resets the SiI9011, so switching back to HDMI
+ * reconfigures it. Init sequence from Windows 0x24f20, except the input
+ * gain (Windows 0x18 = +1.5 dB), which is far too low for line-level audio.
+ */
+static void avertm62_wm8739_write(struct avertm62_dev *dev, u8 reg, u16 val)
+{
+	tm62_i2c_write_reg8(dev, 0, 0x34, (reg << 1) | ((val >> 8) & 1), val & 0xff);
+}
+
+static void avertm62_analog_audio_route(struct avertm62_dev *dev, bool analog)
+{
+	u8 gain = clamp(analog_gain, 0, 31);
+
+	if (analog) {
+		tm62_gpio_dir(dev, 1, true);
+		tm62_gpio_dir(dev, 2, true);
+		tm62_gpio_set(dev, 1, false);
+		tm62_gpio_set(dev, 2, true);
+		msleep(20);
+		avertm62_wm8739_write(dev, 15, 0);	/* reset */
+		avertm62_wm8739_write(dev, 9, 0);	/* inactive */
+		avertm62_wm8739_write(dev, 0, gain);	/* left line in, unmuted */
+		avertm62_wm8739_write(dev, 1, gain);	/* right line in */
+		avertm62_wm8739_write(dev, 5, 0);	/* ADC control */
+		avertm62_wm8739_write(dev, 6, 0x5a);	/* power: line in, ADC, osc on */
+		avertm62_wm8739_write(dev, 7, 0x42);	/* I2S master, 16 bit */
+		avertm62_wm8739_write(dev, 8, 0);	/* 48 kHz, normal mode */
+		avertm62_wm8739_write(dev, 9, 1);	/* active */
+		dev->analog_audio = true;
+	} else if (dev->analog_audio) {
+		avertm62_wm8739_write(dev, 6, 0xff);	/* power everything down */
+		avertm62_wm8739_write(dev, 9, 0);
+		/* back to the load-time state: GPIO1/2 are inputs */
+		tm62_gpio_dir(dev, 1, false);
+		tm62_gpio_dir(dev, 2, false);
+		dev->analog_audio = false;
+		if (dev->hdmi_chip == HDMI_CHIP_SII9011) {
+			sii9011_configure_regs(dev);
+			msleep(100);
+		}
+	}
+}
+
 static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 {
 	u32 w = dev->width;
@@ -1479,8 +1548,8 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		  ((dev->interlaced && dev->input != AVERTM62_INPUT_COMPOSITE) ?
 		   0U : 1U) << 20 |
 		  ((dev->input == AVERTM62_INPUT_HDMI) ? BIT(18) : 0U) |
-		  /* [17:16] audio source: HDMI I2S for the ALSA device */
-		  (((dev->input == AVERTM62_INPUT_HDMI) ? AVERTM62_AUD_SRC_HDMI : 2U) << 16);
+		  /* [17:16] audio source for the ALSA device */
+		  (avertm62_aud_src(dev) << 16);
 	tm62_write32(dev, TM62_REG_CH1_FMT_CFG, fmt_cfg);
 
 	/* Disable VBI DMA */
@@ -1959,6 +2028,7 @@ static int avertm62_start_streaming(struct vb2_queue *vq, unsigned int count)
 	}
 
 	dev->last_irq_pending = 0;
+	avertm62_analog_audio_route(dev, dev->input == AVERTM62_INPUT_COMPOSITE);
 	avertm62_hw_start_streaming(dev);
 
 	spin_lock_irqsave(&dev->qlock, flags);
@@ -2963,7 +3033,7 @@ static int avertm62_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		spin_lock_irqsave(&dev->irq_lock, flags);
-		tm62_write_bf(dev, TM62_REG_CH1_FMT_CFG, 16, 2, AVERTM62_AUD_SRC_HDMI);
+		tm62_write_bf(dev, TM62_REG_CH1_FMT_CFG, 16, 2, avertm62_aud_src(dev));
 		tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 24, 1, 0);
 		tm62_write_bf(dev, TM62_REG_AUD1_DMA_CFG, 31, 1, 1);
 		for (i = 0; i < AVERTM62_AUD_BUFS; i++)
@@ -3026,7 +3096,7 @@ static int avertm62_alsa_init(struct avertm62_dev *dev)
 	if (ret)
 		goto err_card;
 	dev->snd_card = card;
-	dev_info(&dev->pdev->dev, "ALSA capture card %d: HDMI audio (needs HDMI video streaming)\n",
+	dev_info(&dev->pdev->dev, "ALSA capture card %d: HDMI / L-R line audio (needs video streaming)\n",
 		 card->number);
 	return 0;
 

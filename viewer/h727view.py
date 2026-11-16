@@ -5,8 +5,8 @@ h727view - live viewer for the AVerMedia H727 (avertm62 driver).
 Shows the capture device in a window, with an input selector, a deinterlace
 toggle, snapshots and a frame-rate readout. The "Digital TV" source plays
 DVB-T channels (with sound) from the list saved by tools/dvbt_scan.py.
-HDMI plays its audio from the driver's ALSA device (hw:H727); composite is
-video only.
+HDMI and composite play audio from the driver's ALSA device (hw:H727);
+composite audio comes from the breakout's separate L/R jacks.
 
 Usage: h727view.py [/dev/videoN] [--adapter N]
 Needs GTK 3 and GStreamer (gir1.2-gtk-3.0, gir1.2-gstreamer-1.0,
@@ -40,6 +40,7 @@ FE_HAS_LOCK = 0x10
 VERBOSE = False
 HDMI_ALSA = "hw:H727"
 HDMI_ALSA_PROC = "/proc/asound/H727"
+ANALOG_BOOST = 10.0          # software gain for the L/R line input (+20 dB)
 USE_GL = True
 TV_DELAY = 800 * 1000000      # ns, see build_tv_pipeline
 TV_STALL = 10                 # s without a video frame before restarting
@@ -257,10 +258,14 @@ class Viewer(Gtk.Window):
             self.restart()
 
     # --- pipeline ---------------------------------------------------------
+    def input_name(self):
+        return (self.input_combo.get_active_text() or "").upper()
+
     def hdmi_audio_mode(self):
-        """HDMI input selected and the driver registered its ALSA card."""
-        name = self.input_combo.get_active_text() or ""
-        return name.upper().startswith("HDMI") and os.path.exists(HDMI_ALSA_PROC)
+        """HDMI or composite selected and the driver registered its ALSA card."""
+        name = self.input_name()
+        return (name.startswith("HDMI") or name.startswith("COMPOSITE")) and \
+            os.path.exists(HDMI_ALSA_PROC)
 
     def tv_mode(self):
         return self.input_combo.get_active_id() == TV_ID
@@ -276,10 +281,13 @@ class Viewer(Gtk.Window):
         desc = (f"v4l2src device={self.dev} name=src ! video/x-raw,format=YUY2 ! "
                 f"{deint}videoconvert ! gtksink name=sink sync=false")
         if self.hdmi_audio_mode():
-            # the driver's ALSA device carries the HDMI audio (only while
-            # HDMI video is streaming, which this pipeline does)
+            # the driver's ALSA device carries the HDMI audio, or the L/R
+            # jacks on composite (only while video is streaming, which this
+            # pipeline does). The L/R input arrives quiet even at the WM8739's
+            # maximum gain, so it is boosted here.
+            boost = 1.0 if self.input_name().startswith("HDMI") else ANALOG_BOOST
             desc += (f" alsasrc device={HDMI_ALSA} ! queue ! audioconvert ! "
-                     "audioresample ! volume name=vol ! autoaudiosink")
+                     f"volume volume={boost} ! audioresample ! volume name=vol ! autoaudiosink")
         pipe = Gst.parse_launch(desc)
         vol = pipe.get_by_name("vol")
         if vol:
