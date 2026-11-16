@@ -48,6 +48,12 @@ TV_STALL = 10                 # s without a video frame before restarting
 VIDIOC_ENUMINPUT = 0xc050561a
 VIDIOC_G_INPUT = 0x80045626
 VIDIOC_S_INPUT = 0xc0045627
+VIDIOC_G_STD = 0x80085617
+VIDIOC_S_STD = 0x40085618
+VIDIOC_QUERYSTD = 0x8008563f
+STD_PAL = 0x000000ff
+STD_NTSC = 0x0000b000
+STD_AUTO = STD_PAL | STD_NTSC     # both families: the driver auto-detects
 V4L2_IN_ST_NO_SIGNAL = 0x00000002
 
 
@@ -83,6 +89,17 @@ def list_inputs(dev):
     finally:
         os.close(fd)
     return out
+
+
+def std_ioctl(dev, req, value=0):
+    """G_STD / S_STD / QUERYSTD on the capture device; returns the std id."""
+    fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        buf = bytearray(struct.pack("<Q", value))
+        fcntl.ioctl(fd, req, buf)
+        return struct.unpack("<Q", buf)[0]
+    finally:
+        os.close(fd)
 
 
 def get_input(dev):
@@ -231,6 +248,14 @@ class Viewer(Gtk.Window):
         self.chan_combo.set_no_show_all(True)
         bar.pack_start(self.chan_combo, False, False, 0)
 
+        self.std_combo = Gtk.ComboBoxText()
+        for sid, label in (("auto", "Auto"), ("pal", "PAL"), ("ntsc", "NTSC")):
+            self.std_combo.append(sid, label)
+        self.std_combo.set_active_id("auto")
+        self.std_combo.connect("changed", self.on_std_changed)
+        self.std_combo.set_no_show_all(True)
+        bar.pack_start(self.std_combo, False, False, 0)
+
         self.mute = Gtk.CheckButton(label="Mute")
         self.mute.connect("toggled", self.on_mute)
         self.mute.set_no_show_all(True)
@@ -260,6 +285,44 @@ class Viewer(Gtk.Window):
     # --- pipeline ---------------------------------------------------------
     def input_name(self):
         return (self.input_combo.get_active_text() or "").upper()
+
+    def composite_mode(self):
+        return self.input_name().startswith("COMPOSITE")
+
+    def on_std_changed(self, combo):
+        """Apply PAL / NTSC / Auto to the composite decoder and restart."""
+        if not self.composite_mode():
+            return
+        self.stop()
+        value = {"pal": STD_PAL, "ntsc": STD_NTSC}.get(combo.get_active_id(), STD_AUTO)
+        try:
+            std_ioctl(self.dev, VIDIOC_S_STD, value)
+        except OSError as e:
+            self.status.set_text(f"Standard change failed: {e}")
+        self.restart()
+
+    def check_std(self):
+        """In Auto, restart when the source switches between PAL and NTSC."""
+        if not (self.composite_mode() and self.std_combo.get_active_id() == "auto"
+                and self.pipeline):
+            return False
+        try:
+            seen = std_ioctl(self.dev, VIDIOC_QUERYSTD, 0xffffffffffffffff)
+            cur = std_ioctl(self.dev, VIDIOC_G_STD)
+        except OSError:
+            return False
+        if seen and not seen & cur:
+            print(f"composite standard changed ({cur:#x} -> {seen:#x}), restarting", file=sys.stderr)
+            self.restart()
+            return True
+        return False
+
+    def std_name(self):
+        try:
+            cur = std_ioctl(self.dev, VIDIOC_G_STD)
+        except OSError:
+            return ""
+        return "NTSC" if cur & STD_NTSC else "PAL" if cur & STD_PAL else ""
 
     def hdmi_audio_mode(self):
         """HDMI or composite selected and the driver registered its ALSA card."""
@@ -372,6 +435,7 @@ class Viewer(Gtk.Window):
         self.stop()
         tv = self.tv_mode()
         self.chan_combo.set_visible(tv)
+        self.std_combo.set_visible(self.composite_mode())
         self.mute.set_visible(tv or self.hdmi_audio_mode())
         try:
             self.pipeline, self.sink = self.build_pipeline()
@@ -417,6 +481,10 @@ class Viewer(Gtk.Window):
                 s = c.get_structure(0)
                 caps = f"{s.get_value('width')}x{s.get_value('height')}  "
         name = self.input_combo.get_active_text() or ""
+        if self.check_std():
+            return True
+        if self.composite_mode():
+            name = f"{name} {self.std_name()}"
         if self.tv_mode() and self.pipeline:
             ch = self.current_channel() or {}
             st, cnr = self.tuner.status()

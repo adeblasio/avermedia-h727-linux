@@ -82,9 +82,11 @@ MODULE_PARM_DESC(str_route, "Set 0x019c[21:20,17:16] TS/audio route bits (0 = cl
 #define AVERTM62_INPUT_COMPOSITE	1	/* breakout socket, TM6202 internal decoder */
 #define AVERTM62_NUM_INPUTS		2
 
-/* Composite is PAL only for now: 720x576, two 288-line fields per frame */
+/* Composite: PAL 720x576 (two 288-line fields) or NTSC 720x480 (two 240) */
 #define AVERTM62_PAL_WIDTH		720
 #define AVERTM62_PAL_HEIGHT		576
+#define AVERTM62_NTSC_HEIGHT		480
+#define AVERTM62_COMP_STDS		(V4L2_STD_PAL | V4L2_STD_NTSC)
 
 /*
  * Digital TV (DVB-T/C): Micronas DRX-K demodulator (I2C0 0x52, reset on
@@ -342,6 +344,8 @@ struct avertm62_dev {
 	u32			fps;
 	u32			input;		/* AVERTM62_INPUT_* */
 	u32			field_count;	/* composite: fields woven into the current frame */
+	v4l2_std_id		std;		/* composite video standard */
+	bool			std_manual;	/* set by S_STD: stop auto-detecting */
 	int			active_pattern;	/* test_pattern latched at stream start, -1 = live */
 
 	/* Streaming & DMA state */
@@ -1295,6 +1299,52 @@ static void avertm62_copy_hw_to_vb2(struct avertm62_dev *dev,
 }
 
 /* Copy one field into every other line of the frame (field 0 = even lines) */
+static bool avertm62_is_ntsc(struct avertm62_dev *dev)
+{
+	return !!(dev->std & V4L2_STD_525_60);
+}
+
+static u32 avertm62_comp_height(struct avertm62_dev *dev)
+{
+	return avertm62_is_ntsc(dev) ? AVERTM62_NTSC_HEIGHT : AVERTM62_PAL_HEIGHT;
+}
+
+/* Decoder status R3C (0x003c[2]) is set for a 50 Hz input */
+static v4l2_std_id avertm62_detect_std(struct avertm62_dev *dev)
+{
+	return tm62_read_bf(dev, 0x003c, 2, 1) ? V4L2_STD_PAL : V4L2_STD_NTSC;
+}
+
+/*
+ * Per-standard decoder settings (TM6010 core: BAR0 byte n = register Rn),
+ * from Windows' per-standard tables: PAL-B 0x14678, NTSC-M 0x13a68
+ * (chosen from the standard list at 0xfff50, second column = TM6202).
+ */
+static void avertm62_decoder_set_std(struct avertm62_dev *dev)
+{
+	bool ntsc = avertm62_is_ntsc(dev);
+
+	/* R00 [3:1], [4], [6:5] and R01 bit 0 (0x0000[8]) */
+	tm62_write_bf(dev, 0x0000, 1, 3, ntsc ? 0 : 1);
+	tm62_write_bf(dev, 0x0000, 4, 1, ntsc ? 0 : 1);
+	tm62_write_bf(dev, 0x0000, 5, 2, ntsc ? 0 : 1);
+	tm62_write_bf(dev, 0x0000, 8, 1, ntsc ? 1 : 0);
+	/* R08 contrast, R09 brightness, R0A saturation */
+	tm62_write_bf(dev, 0x0008, 0, 8, ntsc ? 0x7f : 0x7e);
+	tm62_write_bf(dev, 0x0008, 8, 8, ntsc ? 0x21 : 0x1f);
+	tm62_write_bf(dev, 0x0008, 16, 8, ntsc ? 0x8d : 0xa8);
+	/* R18-R1B chroma DTO: f_sc / 27 MHz * 2^32 (3.579545 / 4.43361875 MHz) */
+	tm62_write32(dev, 0x0018, ntsc ? 0x1f7cf021 : 0xcb8a092a);
+	/* R30-R32 active video vertical start / height / vsync hlock min */
+	tm62_write_bf(dev, 0x0030, 0, 8, ntsc ? 0x22 : 0x2c);
+	tm62_write_bf(dev, 0x0030, 8, 8, ntsc ? 0x61 : 0xc1);
+	tm62_write_bf(dev, 0x0030, 16, 8, ntsc ? 0x70 : 0x74);
+	/* R3D fields */
+	tm62_write_bf(dev, 0x003c, 8, 4, ntsc ? 0 : 8);
+	tm62_write_bf(dev, 0x003c, 12, 1, ntsc ? 0 : 1);
+	tm62_write_bf(dev, 0x003c, 13, 3, 0);
+}
+
 static void avertm62_copy_hw_field(struct avertm62_dev *dev,
 				   struct avertm62_hw_buf *hb,
 				   u8 *dst, u32 field)
@@ -1624,11 +1674,11 @@ static void avertm62_hw_start_streaming(struct avertm62_dev *dev)
 		 * produces a picture but with a strong echo 7 px to the right and
 		 * the chroma demodulator pinned to the rails.
 		 */
-		tm62_write_bf(dev, 0x0000, 1, 3, 1);
-		/* Contrast: Windows' table default (0x7e) gives standard 16-235 levels */
-		tm62_write_bf(dev, 0x0008, 0, 8, 0x7e);
-		tm62_write32(dev, TM62_REG_CH0_CROP_H, 0x02d00120);	/* 720x288 */
-		tm62_write32(dev, TM62_REG_CH0_CROP_V, 0x02d00120);
+		/* input select, contrast etc. are per standard: decoder_set_std() */
+		avertm62_decoder_set_std(dev);
+		/* 720 x field lines (288 PAL, 240 NTSC) */
+		tm62_write32(dev, TM62_REG_CH0_CROP_H, (720U << 16) | (avertm62_comp_height(dev) / 2));
+		tm62_write32(dev, TM62_REG_CH0_CROP_V, (720U << 16) | (avertm62_comp_height(dev) / 2));
 	}
 
 	dev_info(&dev->pdev->dev,
@@ -2128,7 +2178,7 @@ static int avertm62_try_fmt_vid_cap(struct file *file, void *priv,
 	if (dev->input == AVERTM62_INPUT_COMPOSITE) {
 		/* The decoder output size is fixed (no scaler support yet) */
 		w = AVERTM62_PAL_WIDTH;
-		h = AVERTM62_PAL_HEIGHT;
+		h = avertm62_comp_height(dev);
 	} else {
 		w = clamp_t(u32, ALIGN(w, 2), 640, AVERTM62_MAX_WIDTH);
 		h = clamp_t(u32, ALIGN(h, 2), 480, AVERTM62_MAX_HEIGHT);
@@ -2190,7 +2240,7 @@ static int avertm62_enum_input(struct file *file, void *priv,
 	case AVERTM62_INPUT_COMPOSITE:
 		strscpy(inp->name, "Composite", sizeof(inp->name));
 		inp->type = V4L2_INPUT_TYPE_CAMERA;
-		inp->std = V4L2_STD_PAL;
+		inp->std = AVERTM62_COMP_STDS;
 		return 0;
 	default:
 		return -EINVAL;
@@ -2205,21 +2255,28 @@ static int avertm62_g_input(struct file *file, void *priv, unsigned int *i)
 	return 0;
 }
 
+static void avertm62_auto_std(struct avertm62_dev *dev);
+
 static int avertm62_s_input(struct file *file, void *priv, unsigned int i)
 {
 	struct avertm62_dev *dev = video_drvdata(file);
 
 	if (i >= AVERTM62_NUM_INPUTS)
 		return -EINVAL;
-	if (i == dev->input)
+	if (i == dev->input) {
+		avertm62_auto_std(dev);
 		return 0;
+	}
 	if (vb2_is_busy(&dev->vb2_q))
 		return -EBUSY;
 
 	dev->input = i;
 	if (i == AVERTM62_INPUT_COMPOSITE) {
+		/* follow the incoming standard; S_STD can still override it */
+		dev->std_manual = false;
+		dev->std = avertm62_detect_std(dev);
 		dev->width = AVERTM62_PAL_WIDTH;
-		dev->height = AVERTM62_PAL_HEIGHT;
+		dev->height = avertm62_comp_height(dev);
 		dev->interlaced = true;
 	} else {
 		dev->width = AVERTM62_MAX_WIDTH;
@@ -2250,7 +2307,7 @@ static int avertm62_enum_framesizes(struct file *file, void *priv,
 			return -EINVAL;
 		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 		fsize->discrete.width = AVERTM62_PAL_WIDTH;
-		fsize->discrete.height = AVERTM62_PAL_HEIGHT;
+		fsize->discrete.height = avertm62_comp_height(dev);
 		return 0;
 	}
 	if (fsize->index >= ARRAY_SIZE(sizes))
@@ -2259,6 +2316,75 @@ static int avertm62_enum_framesizes(struct file *file, void *priv,
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsize->discrete.width = sizes[fsize->index].w;
 	fsize->discrete.height = sizes[fsize->index].h;
+	return 0;
+}
+
+/* Composite: follow the incoming standard unless S_STD fixed one */
+static void avertm62_auto_std(struct avertm62_dev *dev)
+{
+	if (dev->input != AVERTM62_INPUT_COMPOSITE || dev->std_manual ||
+	    vb2_is_busy(&dev->vb2_q))
+		return;
+	dev->std = avertm62_detect_std(dev);
+	dev->width = AVERTM62_PAL_WIDTH;
+	dev->height = avertm62_comp_height(dev);
+	dev->bytesperline = dev->width * 2;
+	dev->sizeimage = dev->bytesperline * dev->height;
+}
+
+static void avertm62_frame_interval(struct avertm62_dev *dev, struct v4l2_fract *f)
+{
+	if (dev->input == AVERTM62_INPUT_COMPOSITE && avertm62_is_ntsc(dev)) {
+		f->numerator = 1001;
+		f->denominator = 30000;
+	} else {
+		f->numerator = 1;
+		f->denominator = dev->input == AVERTM62_INPUT_COMPOSITE ? 25 : 30;
+	}
+}
+
+static int avertm62_g_std(struct file *file, void *priv, v4l2_std_id *std)
+{
+	struct avertm62_dev *dev = video_drvdata(file);
+
+	if (dev->input != AVERTM62_INPUT_COMPOSITE)
+		return -ENODATA;
+	*std = dev->std;
+	return 0;
+}
+
+static int avertm62_s_std(struct file *file, void *priv, v4l2_std_id std)
+{
+	struct avertm62_dev *dev = video_drvdata(file);
+
+	if (dev->input != AVERTM62_INPUT_COMPOSITE)
+		return -ENODATA;
+	if (!(std & AVERTM62_COMP_STDS))
+		return -EINVAL;
+	if (vb2_is_busy(&dev->vb2_q))
+		return -EBUSY;
+	if ((std & V4L2_STD_525_60) && (std & V4L2_STD_625_50)) {
+		/* both families (e.g. V4L2_STD_ALL): go back to auto-detection */
+		dev->std_manual = false;
+		avertm62_auto_std(dev);
+		return 0;
+	}
+	dev->std = (std & V4L2_STD_525_60) ? V4L2_STD_NTSC : V4L2_STD_PAL;
+	dev->std_manual = true;
+	dev->width = AVERTM62_PAL_WIDTH;
+	dev->height = avertm62_comp_height(dev);
+	dev->bytesperline = dev->width * 2;
+	dev->sizeimage = dev->bytesperline * dev->height;
+	return 0;
+}
+
+static int avertm62_querystd(struct file *file, void *priv, v4l2_std_id *std)
+{
+	struct avertm62_dev *dev = video_drvdata(file);
+
+	if (dev->input != AVERTM62_INPUT_COMPOSITE)
+		return -ENODATA;
+	*std &= avertm62_detect_std(dev);
 	return 0;
 }
 
@@ -2272,10 +2398,7 @@ static int avertm62_enum_frameintervals(struct file *file, void *priv,
 		return -EINVAL;
 
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fival->discrete.numerator = 1;
-	fival->discrete.denominator =
-		(((struct avertm62_dev *)video_drvdata(file))->input ==
-		 AVERTM62_INPUT_COMPOSITE) ? 25 : 30;
+	avertm62_frame_interval(video_drvdata(file), &fival->discrete);
 	return 0;
 }
 
@@ -2287,10 +2410,7 @@ static int avertm62_g_parm(struct file *file, void *priv,
 
 	sp->parm.capture.capability   = V4L2_CAP_TIMEPERFRAME;
 	sp->parm.capture.readbuffers  = 4;
-	sp->parm.capture.timeperframe.numerator   = 1;
-	sp->parm.capture.timeperframe.denominator =
-		(((struct avertm62_dev *)video_drvdata(file))->input ==
-		 AVERTM62_INPUT_COMPOSITE) ? 25 : 30;
+	avertm62_frame_interval(video_drvdata(file), &sp->parm.capture.timeperframe);
 	return 0;
 }
 
@@ -2388,6 +2508,9 @@ static const struct v4l2_ioctl_ops avertm62_ioctl_ops = {
 	.vidioc_enum_input          = avertm62_enum_input,
 	.vidioc_g_input             = avertm62_g_input,
 	.vidioc_s_input             = avertm62_s_input,
+	.vidioc_g_std               = avertm62_g_std,
+	.vidioc_s_std               = avertm62_s_std,
+	.vidioc_querystd            = avertm62_querystd,
 	.vidioc_reqbufs             = vb2_ioctl_reqbufs,
 	.vidioc_create_bufs         = vb2_ioctl_create_bufs,
 	.vidioc_prepare_buf         = vb2_ioctl_prepare_buf,
@@ -2400,9 +2523,26 @@ static const struct v4l2_ioctl_ops avertm62_ioctl_ops = {
 	.vidioc_log_status          = avertm62_log_status,
 };
 
+/* Every open re-checks the composite standard (e.g. the source switched
+ * between PAL and NTSC since the last capture) */
+static int avertm62_open(struct file *file)
+{
+	struct avertm62_dev *dev = video_drvdata(file);
+	int ret = v4l2_fh_open(file);
+
+	if (ret)
+		return ret;
+	if (v4l2_fh_is_singular_file(file)) {
+		mutex_lock(&dev->lock);
+		avertm62_auto_std(dev);
+		mutex_unlock(&dev->lock);
+	}
+	return 0;
+}
+
 static const struct v4l2_file_operations avertm62_fops = {
 	.owner          = THIS_MODULE,
-	.open           = v4l2_fh_open,
+	.open           = avertm62_open,
 	.release        = vb2_fop_release,
 	.read           = vb2_fop_read,
 	.poll           = vb2_fop_poll,
@@ -3147,6 +3287,7 @@ static int avertm62_pci_probe(struct pci_dev *pdev,
 	dev->width        = 1920;
 	dev->height       = 1080;
 	dev->pixelformat  = V4L2_PIX_FMT_YUYV;
+	dev->std          = V4L2_STD_PAL;
 	dev->bytesperline = dev->width * 2;
 	dev->sizeimage    = dev->width * dev->height * 2;
 	dev->fps          = 60;
@@ -3237,6 +3378,7 @@ static int avertm62_pci_probe(struct pci_dev *pdev,
 	strscpy(vdev->name, "AVerMedia H727 HDMI Capture", sizeof(vdev->name));
 	vdev->fops        = &avertm62_fops;
 	vdev->ioctl_ops   = &avertm62_ioctl_ops;
+	vdev->tvnorms     = AVERTM62_COMP_STDS;
 	vdev->v4l2_dev    = &dev->v4l2_dev;
 	vdev->queue       = q;
 	vdev->lock        = &dev->lock;

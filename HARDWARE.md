@@ -293,6 +293,29 @@ Pitfalls found on the way:
 - `debug_sysfs=1` fills the debug DMA buffers with 0xaa and adds a ninth
   buffer that no stream uses, for experiments.
 
+### Composite standards: PAL and NTSC (2026-11-16)
+
+Windows keeps one decoder table per video standard: the list of KS
+standard flags at 0xfff50 (NTSC-M = 1, NTSC-J, NTSC-4.43, PAL-B = 0x10, ...)
+indexes a pair of routines per standard (second column = TM6202). PAL-B is
+0x14678, NTSC-M is 0x13a68. The differences (BAR0 byte n = TM6010 Rn):
+
+| Register | PAL | NTSC |
+|---|---|---|
+| `0x0000[3:1]`, `[4]`, `[6:5]` (R00) | 1, 1, 1 | 0, 0, 0 |
+| `0x0000[8]` (R01 bit 0) | 0 | 1 |
+| R08 / R09 / R0A (contrast, brightness, saturation) | 0x7e / 0x1f / 0xa8 | 0x7f / 0x21 / 0x8d |
+| R18-R1B chroma DTO (`0x0018`) | 0xcb8a092a (4.43361875 MHz) | 0x1f7cf021 (3.579545 MHz) |
+| R30 / R31 / R32 | 0x2c / 0xc1 / 0x74 | 0x22 / 0x61 / 0x70 |
+| `0x003c[11:8]`, `[12]` (R3D) | 8, 1 | 0, 0 |
+| Field window `0x0170`/`0x0174` | 720 x 288 | 720 x 240 |
+
+- `0x003c[2]` (R3C) is set for a 50 Hz input; the driver uses it to pick
+  the standard when the composite input is selected (VIDIOC_QUERYSTD, and
+  S_STD can override it).
+- Using Linux tm6000's NTSC table instead (it changes R2E/R33 and not
+  R00[3:1]/R01) gives a picture shifted by about half a line.
+
 ### Analog audio: the L/R jacks (solved 2026-11-16)
 
 The breakout's separate **L/R audio jacks** (not the red/white plugs in the

@@ -9,7 +9,7 @@ the hardware live.
 |---|---|
 | HDMI video (up to 1080i/1080p) | Working: V4L2 `/dev/videoN`, input 0 |
 | HDMI audio | Working: ALSA card `H727` (48 kHz stereo) |
-| Composite video (PAL) | Working: V4L2 input 1, colour, 25 fps |
+| Composite video (PAL / NTSC) | Working: V4L2 input 1, colour; PAL 720x576 25 fps, NTSC 720x480 29.97 fps, standard detected automatically |
 | Digital TV (DVB-T) | Working: `/dev/dvb/adapterN` (frontend, demux, dvr) |
 | Analog audio (breakout L/R jacks) | Working: same ALSA card, with composite |
 | Component (YPbPr), S-Video | Not tested |
@@ -70,7 +70,9 @@ python3 viewer/h727view.py                 # starts on the current V4L2 input
 python3 viewer/h727view.py --tv "ABC TV"   # starts on a TV channel
 ```
 
-HDMI, composite (with the L/R jacks) and TV play with sound. Any V4L2/DVB/ALSA application should also work,
+HDMI, composite (with the L/R jacks) and TV play with sound. For composite, a
+Standard menu offers Auto (default: follows the source, and restarts the picture
+when it switches between PAL and NTSC), PAL or NTSC. Any V4L2/DVB/ALSA application should also work,
 for example:
 
 ```bash
