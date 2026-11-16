@@ -6,7 +6,8 @@
 #            registers all read 0xffffffff)
 set -eu
 
-KO="/home/shinji/Home Entertainment/avertm62/avertm62.ko"
+# install-devtools.sh replaces @SRCDIR@ with the checkout directory
+KO="@SRCDIR@/avertm62.ko"
 
 RESET=0
 if [ "${1:-}" = "--reset" ]; then
@@ -27,6 +28,7 @@ modprobe videobuf2-v4l2
 modprobe videobuf2-vmalloc
 modprobe i2c-dev
 modprobe dvb-core
+modprobe snd-pcm
 rmmod avertm62 2>/dev/null || true
 if [ "$RESET" = 1 ]; then
 	for dev in /sys/bus/pci/devices/*; do

@@ -4,7 +4,7 @@
 # Remove again with: sudo sh install-devtools.sh --remove
 set -eu
 
-USER_NAME=shinji
+USER_NAME="${SUDO_USER:-$(logname)}"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 RULE=/etc/sudoers.d/avertm62-dev
 
@@ -14,7 +14,10 @@ if [ "${1:-}" = "--remove" ]; then
 	exit 0
 fi
 
-install -o root -g root -m 0755 "$SRC/avertm62-load" /usr/local/sbin/avertm62-load
+LOADER="$(mktemp)"
+sed "s|@SRCDIR@|$SRC|" "$SRC/avertm62-load" > "$LOADER"
+install -o root -g root -m 0755 "$LOADER" /usr/local/sbin/avertm62-load
+rm -f "$LOADER"
 install -o root -g root -m 0755 "$SRC/tm62reg.py" /usr/local/sbin/tm62reg
 
 TMP="$(mktemp)"

@@ -4,10 +4,16 @@ This folder contains reverse-engineered disassembly, register mappings, and hard
 
 ## Files in this Directory
 
-1. [`AVerTM62_x64.sys`](file:///home/shinji/Home%20Entertainment/avertm62/decompiled/AVerTM62_x64.sys): Original Windows x64 PE driver binary (1.1 MB).
-2. [`AVerTM62_x64.asm`](file:///home/shinji/Home%20Entertainment/avertm62/decompiled/AVerTM62_x64.asm): Full disassembly of the entire `.text` section (x86_64 Intel syntax, 5.3 MB).
-3. [`regmap.json`](file:///home/shinji/Home%20Entertainment/avertm62/decompiled/regmap.json): Complete lookup table mapping driver internal object offsets to hardware BAR0 MMIO register offsets (`0x0000..0x0788`) and bitfield slices `[MSB:LSB]`.
-4. [`tm6202_annotated_key_routines.asm`](file:///home/shinji/Home%20Entertainment/avertm62/decompiled/tm6202_annotated_key_routines.asm): Curated disassembly of the core video, DMA, and interrupt routines with inline annotations mapping raw offsets to actual BAR0 registers.
+Only `README.md` and `regmap.json` are in the repository. The Windows driver
+binary and its disassembly are AVerMedia's copyright and are not
+redistributed; extract the driver from AVerMedia's installer and disassemble
+it yourself (for example with `objdump -d -M intel`) to follow the addresses
+quoted here and in `HARDWARE.md`.
+
+1. [`AVerTM62_x64.sys`](AVerTM62_x64.sys): Original Windows x64 PE driver binary (1.1 MB).
+2. [`AVerTM62_x64.asm`](AVerTM62_x64.asm): Full disassembly of the entire `.text` section (x86_64 Intel syntax, 5.3 MB).
+3. [`regmap.json`](regmap.json): Complete lookup table mapping driver internal object offsets to hardware BAR0 MMIO register offsets (`0x0000..0x0788`) and bitfield slices `[MSB:LSB]`.
+4. [`tm6202_annotated_key_routines.asm`](tm6202_annotated_key_routines.asm): Curated disassembly of the core video, DMA, and interrupt routines with inline annotations mapping raw offsets to actual BAR0 registers.
 
 ---
 

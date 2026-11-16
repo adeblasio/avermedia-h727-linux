@@ -19,6 +19,8 @@ load: all
 	sudo modprobe videodev
 	sudo modprobe videobuf2-v4l2
 	sudo modprobe videobuf2-vmalloc
+	sudo modprobe dvb-core
+	sudo modprobe snd-pcm
 	-sudo rmmod avertm62 2>/dev/null
 	sudo insmod avertm62.ko
 	sudo dmesg | tail -n 15
